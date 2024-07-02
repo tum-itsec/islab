@@ -1,0 +1,5507 @@
+diff --git a/arch/x86/boot/.gitignore b/arch/x86/boot/.gitignore
+index 9cc7f1357b9b..52c12545ecb4 100644
+--- a/arch/x86/boot/.gitignore
++++ b/arch/x86/boot/.gitignore
+@@ -1,6 +1,6 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ bootsect
+-bzImage
++bzImage*
+ cpustr.h
+ mkcpustr
+ voffset.h
+diff --git a/arch/x86/entry/entry_64.S b/arch/x86/entry/entry_64.S
+index ce0464d630a2..01dd5e094f42 100644
+--- a/arch/x86/entry/entry_64.S
++++ b/arch/x86/entry/entry_64.S
+@@ -349,12 +349,75 @@ SYM_CODE_END(ret_from_fork)
+ .macro idtentry vector asmsym cfunc has_error_code:req
+ SYM_CODE_START(\asmsym)
+ 	UNWIND_HINT_IRET_REGS offset=\has_error_code*8
+-	ASM_CLAC
+ 
+ 	.if \has_error_code == 0
+ 		pushq	$-1			/* ORIG_RAX: no syscall to restart */
+ 	.endif
+ 
++	testb	$3, CS-ORIG_RAX(%rsp)
++	jnz	.Lksmap_user_space_\@
++
++	pushq %r15 // save r15
++	pushq %r14 // save r14
++
++	pushf // load rflags in r14
++	popq %r14
++
++	movq %rsp, %r15 // save iret stack
++	movq PER_CPU_VAR(current_task), %rsp // load current_task
++	movq TASK_ksmap_iret_stack(%rsp), %rsp // load current->ksmap_iret_stack into rsp
++	
++	testq $X86_EFLAGS_AC, %r14 // check if smap disabled
++	jnz .Lksmap_disabled_\@
++
++	ASM_STAC // enable smap
++
++	// at this point rsp holds the ksmap stack
++	pushq %r14 // push rflags
++	
++	jmp .Lksmap_continue_\@
++
++.Lksmap_disabled_\@:
++
++	// at this point rsp holds the ksmap stack
++	pushq %rdi // push all regs
++	pushq %rsi
++	pushq %rdx
++	pushq %rcx
++	pushq %rax
++	pushq %r8
++	pushq %r9
++	pushq %r10
++	pushq %r11
++	pushq %rbx
++	pushq %rbp
++	pushq %r12
++	pushq %r13
++	pushq 0*8(%r15) // push saved r14
++	pushq 1*8(%r15) // push saved r15
++	
++	pushq %r14 // push rflags
++
++.Lksmap_continue_\@:
++
++	movq PER_CPU_VAR(current_task), %r14 // load current_task
++	movq %rsp, TASK_ksmap_iret_stack(%r14) // store ksmap stack
++
++	// no need to check integrity of ksmap_iret_stack pointer,
++	// we'll do that on irq return
++	//andq $(KSMAP_stack_mask), %rsp // mask to TOS
++	//cmpq KSMAP_tsk_bck_ref(%rsp), %r14 // compare with value of current
++	//je .Lksmap_tsk_ref_ok_\@
++	//ud2
++
++.Lksmap_tsk_ref_ok_\@:
++	movq %r15, %rsp // restore iret stack
++	popq %r14 // restore r14
++	popq %r15 // restore r15
++
++.Lksmap_user_space_\@:
++	ASM_CLAC
++
+ 	.if \vector == X86_TRAP_BP
+ 		/*
+ 		 * If coming from kernel space, create a 6-word gap to allow the
+@@ -373,8 +436,76 @@ SYM_CODE_START(\asmsym)
+ 
+ _ASM_NOKPROBE(\asmsym)
+ SYM_CODE_END(\asmsym)
++
++//SYM_CODE_START_LOCAL(ksmap_tramp_\asmsym)
++//	ASM_STAC
++//	retq
++//SYM_CODE_END(ksmap_tramp_\asmsym)
+ .endm
+ 
++SYM_CODE_START_LOCAL(ksmap_tramp)
++	ASM_CLAC
++	retq
++SYM_CODE_END(ksmap_tramp)
++
++// older approach with inserting trampoline on iret
++
++//	subq $PADD, %rsp // make room for tramp rip
++//
++//	pushq %rsi
++//	pushq %rdi // save rdi
++//
++////	movq 7*8(%rsp), %rdi
++////	subq %rsp, %rdi
++////	cmpq $72, %rdi
++////	je .Lneeds_room_for_ksmap_tramp_\@
++////	ja .Lno_room_needed_for_ksmap_tramp_\@
++////	ud2
++////
++////.Lno_room_needed_for_ksmap_tramp_\@:
++////	movq 7*8(%rsp), %rsi // rsp
++////	subq $8, %rsi 	// point it to orig irq'ed rip
++////	movq %rsi, 7*8(%rsp)
++////
++////	movq 4*8(%rsp), %rdi // orig irq'ed rip
++////	movq %rdi, (%rsi)
++////
++////	leaq ksmap_tramp, %rdi
++////	movq %rdi, 4*8(%rsp) // tramp rip
++////
++////	popq %rdi
++////	popq %rsi
++////
++////	addq $8, %rsp
++////
++////	jmp .Lcontinue_\@
++////.Lneeds_room_for_ksmap_tramp_\@:
++//
++//	movq KOERR(%rsp), %rdi // error code
++//	movq %rdi, KNERR(%rsp)
++//	movq KORIP(%rsp), %rdi // rip
++//	movq %rdi, KNRIP(%rsp)
++//	movq KOCS(%rsp), %rdi // cs
++//	movq %rdi, KNCS(%rsp)
++//	movq KOEFLAGS(%rsp), %rdi // rflags
++//	movq %rdi, KNEFLAGS(%rsp)
++//	movq KORSP(%rsp), %rsi // rsp
++//	subq $8, %rsi 	// point saved rsp to irq'ed rip
++//	movq %rsi, KNRSP(%rsp)
++//	movq KOSS(%rsp), %rdi // ss
++//	movq %rdi, KNSS(%rsp)
++//
++//	movq KNRIP(%rsp), %rdi // orig irq'ed rip
++//	movq %rdi, (%rsi)
++//
++//	//leaq ksmap_tramp_\asmsym, %rdi
++//	leaq ksmap_tramp, %rdi
++//	movq %rdi, KNRIP(%rsp) // tramp rip
++//
++//	popq %rdi // restore rdi
++//	popq %rsi // restore rsi
++//
++
+ /*
+  * Interrupt entry/exit.
+  *
+@@ -615,13 +746,108 @@ SYM_INNER_LABEL(restore_regs_and_return_to_kernel, SYM_L_GLOBAL)
+ 	ud2
+ 1:
+ #endif
+-	POP_REGS
++	ASM_STAC
++
++	movq PER_CPU_VAR(current_task), %r14 // load current_task
++	movq TASK_ksmap_iret_stack(%r14), %r13 // load current->ksmap_iret_regs into r13
++	movq %r13, %rdi // move ksmap stack in rdi	
++	
++	// check integrity of ksmap_iret_stack pointer	
++	andq $(KSMAP_stack_mask), %rdi // mask to get to TOS
++	cmpq KSMAP_tsk_bck_ref(%rdi), %r14 // cmp ksmap bck ref with value current
++	jne .Lksmap_fault
++
++.Lksmap_tsk_ref_ok:
++	
++	// check valid ksmap_iret_regs stack
++	leaq init_ksmap_iret_stack, %rsi // no need to check for init ksmap stack
++	cmpq %rdi, %rsi
++	je .Lskip_ksmap_verify_va
++	callq ksmap_verify_va
++
++.Lskip_ksmap_verify_va:
++	movq %r13, %rdi // move ksmap stack in rdi
++	xchgq %rdi, %rsp // save iret stack in rdi, and mov ksmap stack in rsp
++
++	popq %r13 // pop saved rflags
++	testq $X86_EFLAGS_AC, %r13 // check if SMAP should be disabled
++	jnz .Lret_ksmap_disabled
++
++	movq %rsp, TASK_ksmap_iret_stack(%r14) // we're done, save ksmap stack
++
++	// manual iret
++	// iret stack still in rdi at this point
++	movq    RSP(%rdi), %rsp // get irq'ed stack
++
++	pushq    RIP(%rdi) // push irq'ed rip
++	pushq    EFLAGS(%rdi) // push irq'ed flags
++	movq    %rsp, RIP(%rdi) // prepare irq'ed stack
++	
++	movq %rdi, %rsp // restore iret stack
++
++	POP_REGS // restore regs
+ 	addq	$8, %rsp	/* skip regs->orig_ax */
++
++	popq    %rsp // switch to irq'ed stack, should have flags followed by rip
++
++	popfq   // restore flags
++	ASM_CLAC // enable SMAP
++	ret     // ret from irq
++
++.Lret_ksmap_disabled:
++
++	// adjust ksmap stack for after we restored everything
++	movq %rsp, %r13
++	addq $(RDI+8), %r13 // make it look like we popped all regs 
++	movq %r13, TASK_ksmap_iret_stack(%r14) // save ksmap stack
++
++	movq %rsp, %r14 // store ksmap stack temporarily in rsi
++
++	// prepare manual iret
++	// iret stack still in rdi at this point
++	movq    RSP(%rdi), %rsp // get irq'ed stack
++
++	pushq    RIP(%rdi) // push irq'ed rip
++	pushq    EFLAGS(%rdi) // push irq'ed flags
++	movq    %rsp, RIP(%rdi) // prepare irq'ed stack
++
++	// restore all regs from ksmap stack	
++	movq %r14, %rsp // restore ksmap stack
++
++	popq %r15 // restore all regs
++	popq %r14
++	popq %r13
++	popq %r12
++	popq %rbp
++	popq %rbx
++	popq %r11
++	popq %r10
++	popq %r9
++	popq %r8
++	popq %rax
++	popq %rcx
++	popq %rdx
++	popq %rsi
++
++	xchgq %rsp, %rdi // restore iret stack
++	movq (%rdi), %rdi // restore rdi
++	
++	addq $(ORIG_RAX+8), %rsp // adjust iret stack
++	
++	popq    %rsp // switch to irq'ed stack, should have flags followed by rip
++
++	popfq   // restore flags
++		// don't enable SMAP
++	ret     // ret from irq
++
++.Lksmap_fault:
++	ud2
++
+ 	/*
+ 	 * ARCH_HAS_MEMBARRIER_SYNC_CORE rely on IRET core serialization
+ 	 * when returning from IPI handler.
+ 	 */
+-	INTERRUPT_RETURN
++	//INTERRUPT_RETURN
+ 
+ SYM_INNER_LABEL_ALIGN(native_iret, SYM_L_GLOBAL)
+ 	UNWIND_HINT_IRET_REGS
+diff --git a/arch/x86/include/asm/pgtable_types.h b/arch/x86/include/asm/pgtable_types.h
+index f24d7ef8fffa..28f6bd048f40 100644
+--- a/arch/x86/include/asm/pgtable_types.h
++++ b/arch/x86/include/asm/pgtable_types.h
+@@ -187,6 +187,7 @@ enum page_cache_mode {
+ #define PAGE_READONLY_EXEC   __pg(__PP|   0|_USR|___A|   0|   0|   0|   0)
+ 
+ #define __PAGE_KERNEL		 (__PP|__RW|   0|___A|__NX|___D|   0|___G)
++#define __PAGE_KERNEL_KSMAP	 (__PP|__RW|_USR|___A|__NX|___D|   0|___G)
+ #define __PAGE_KERNEL_EXEC	 (__PP|__RW|   0|___A|   0|___D|   0|___G)
+ #define _KERNPG_TABLE_NOENC	 (__PP|__RW|   0|___A|   0|___D|   0|   0)
+ #define _KERNPG_TABLE		 (__PP|__RW|   0|___A|   0|___D|   0|   0| _ENC)
+@@ -215,6 +216,7 @@ enum page_cache_mode {
+ #define __pgprot_mask(x)	__pgprot((x) & __default_kernel_pte_mask)
+ 
+ #define PAGE_KERNEL		__pgprot_mask(__PAGE_KERNEL            | _ENC)
++#define PAGE_KERNEL_KSMAP	__pgprot_mask(__PAGE_KERNEL_KSMAP      | _ENC)
+ #define PAGE_KERNEL_NOENC	__pgprot_mask(__PAGE_KERNEL            |    0)
+ #define PAGE_KERNEL_RO		__pgprot_mask(__PAGE_KERNEL_RO         | _ENC)
+ #define PAGE_KERNEL_EXEC	__pgprot_mask(__PAGE_KERNEL_EXEC       | _ENC)
+diff --git a/arch/x86/include/asm/processor.h b/arch/x86/include/asm/processor.h
+index c20a52b5534b..148e812ba8e3 100644
+--- a/arch/x86/include/asm/processor.h
++++ b/arch/x86/include/asm/processor.h
+@@ -196,6 +196,9 @@ static inline unsigned long long l1tf_pfn_limit(void)
+ 
+ extern void early_cpu_init(void);
+ extern void identify_boot_cpu(void);
++#ifdef CONFIG_KSMAP
++extern void identify_boot_cpu_late(void);
++#endif
+ extern void identify_secondary_cpu(struct cpuinfo_x86 *);
+ extern void print_cpu_info(struct cpuinfo_x86 *);
+ void print_cpu_msr(struct cpuinfo_x86 *);
+diff --git a/arch/x86/include/asm/ptrace.h b/arch/x86/include/asm/ptrace.h
+index d8324a236696..36451fddb7d1 100644
+--- a/arch/x86/include/asm/ptrace.h
++++ b/arch/x86/include/asm/ptrace.h
+@@ -87,7 +87,6 @@ struct pt_regs {
+ 	unsigned long ss;
+ /* top of stack page */
+ };
+-
+ #endif /* !__i386__ */
+ 
+ #ifdef CONFIG_PARAVIRT
+diff --git a/arch/x86/include/asm/smap.h b/arch/x86/include/asm/smap.h
+index 8b58d6975d5d..fc7843fdb6e4 100644
+--- a/arch/x86/include/asm/smap.h
++++ b/arch/x86/include/asm/smap.h
+@@ -37,6 +37,8 @@
+ 
+ #else /* __ASSEMBLY__ */
+ 
++#include <linux/ksmap.h>
++
+ #include <asm/alternative.h>
+ 
+ #ifdef CONFIG_X86_SMAP
+@@ -49,6 +51,8 @@ static __always_inline void clac(void)
+ 
+ static __always_inline void stac(void)
+ {
++	ksmap_nesting_warning();
++
+ 	/* Note: a barrier is implicit in alternative() */
+ 	alternative("", __ASM_STAC, X86_FEATURE_SMAP);
+ }
+diff --git a/arch/x86/include/asm/uaccess_64.h b/arch/x86/include/asm/uaccess_64.h
+index e7265a552f4f..72997a378aff 100644
+--- a/arch/x86/include/asm/uaccess_64.h
++++ b/arch/x86/include/asm/uaccess_64.h
+@@ -29,6 +29,8 @@ copy_user_generic(void *to, const void *from, unsigned len)
+ {
+ 	unsigned ret;
+ 
++	ksmap_nesting_warning();	
++
+ 	/*
+ 	 * If CPU has ERMS feature, use copy_user_enhanced_fast_string.
+ 	 * Otherwise, if CPU has rep_good feature, use copy_user_generic_string.
+@@ -49,18 +51,24 @@ copy_user_generic(void *to, const void *from, unsigned len)
+ static __always_inline __must_check unsigned long
+ raw_copy_from_user(void *dst, const void __user *src, unsigned long size)
+ {
++	ksmap_nesting_warning();
++
+ 	return copy_user_generic(dst, (__force void *)src, size);
+ }
+ 
+ static __always_inline __must_check unsigned long
+ raw_copy_to_user(void __user *dst, const void *src, unsigned long size)
+ {
++	ksmap_nesting_warning();
++
+ 	return copy_user_generic((__force void *)dst, src, size);
+ }
+ 
+ static __always_inline __must_check
+ unsigned long raw_copy_in_user(void __user *dst, const void __user *src, unsigned long size)
+ {
++	ksmap_nesting_warning();	
++
+ 	return copy_user_generic((__force void *)dst,
+ 				 (__force void *)src, size);
+ }
+@@ -76,6 +84,8 @@ static inline int
+ __copy_from_user_inatomic_nocache(void *dst, const void __user *src,
+ 				  unsigned size)
+ {
++	ksmap_nesting_warning();	
++
+ 	kasan_check_write(dst, size);
+ 	return __copy_user_nocache(dst, src, size, 0);
+ }
+@@ -83,6 +93,8 @@ __copy_from_user_inatomic_nocache(void *dst, const void __user *src,
+ static inline int
+ __copy_from_user_flushcache(void *dst, const void __user *src, unsigned size)
+ {
++	ksmap_nesting_warning();	
++
+ 	kasan_check_write(dst, size);
+ 	return __copy_user_flushcache(dst, src, size);
+ }
+diff --git a/arch/x86/kernel/asm-offsets.c b/arch/x86/kernel/asm-offsets.c
+index 60b9f42ce3c1..d0e442c8ee6b 100644
+--- a/arch/x86/kernel/asm-offsets.c
++++ b/arch/x86/kernel/asm-offsets.c
+@@ -36,6 +36,9 @@ static void __used common(void)
+ #ifdef CONFIG_STACKPROTECTOR
+ 	OFFSET(TASK_stack_canary, task_struct, stack_canary);
+ #endif
++	OFFSET(TASK_ksmap_iret_stack, task_struct, ksmap_iret_stack);
++	OFFSET(KSMAP_tsk_bck_ref, ksmap_iret_stack, tsk_bck_ref);
++	DEFINE(KSMAP_stack_mask, (~(KSMAP_STACK_SIZE - 1)));
+ 
+ 	BLANK();
+ 	OFFSET(crypto_tfm_ctx_offset, crypto_tfm, __crt_ctx);
+diff --git a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
+index 9215b91bc044..b93f6fa94c92 100644
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@ -1559,7 +1559,13 @@ static void identify_cpu(struct cpuinfo_x86 *c)
+ 
+ 	/* Set up SMEP/SMAP/UMIP */
+ 	setup_smep(c);
+-	setup_smap(c);
++#ifdef CONFIG_KSMAP
++       	// don't setup smap yet for the boot CPU when ksmap is enabled
++       	if (c != &boot_cpu_data)
++               setup_smap(c);
++#else
++       	setup_smap(c);
++#endif
+ 	setup_umip(c);
+ 
+ 	/* Enable FSGSBASE instructions if available. */
+@@ -1665,11 +1671,21 @@ void __init identify_boot_cpu(void)
+ 	enable_sep_cpu();
+ #endif
+ 	cpu_detect_tlb(&boot_cpu_data);
++#ifndef CONFIG_KSMAP
+ 	setup_cr_pinning();
++#endif
+ 
+ 	tsx_init();
+ }
+ 
++#ifdef CONFIG_KSMAP 
++void __init identify_boot_cpu_late(void)
++{
++       setup_smap(&boot_cpu_data);
++       setup_cr_pinning();
++}
++#endif
++
+ void identify_secondary_cpu(struct cpuinfo_x86 *c)
+ {
+ 	BUG_ON(c == &boot_cpu_data);
+diff --git a/arch/x86/kernel/head_64.S b/arch/x86/kernel/head_64.S
+index 04bddaaba8e2..a3779c6554c1 100644
+--- a/arch/x86/kernel/head_64.S
++++ b/arch/x86/kernel/head_64.S
+@@ -396,6 +396,13 @@ SYM_CODE_START_LOCAL(early_idt_handler_common)
+ 	pushq %r15				/* pt_regs->r15 */
+ 	UNWIND_HINT_REGS
+ 
++	movq %rsp, %r15
++	movq PER_CPU_VAR(current_task), %r14 // load current_task
++	movq TASK_ksmap_iret_stack(%r14), %rsp // load current->ksmap_iret_stack
++	pushf // push rflags on ksmap stack
++	movq %rsp, TASK_ksmap_iret_stack(%r14) // save ksmap stack
++	movq %r15, %rsp // restore iret stack
++
+ 	movq %rsp,%rdi		/* RDI = pt_regs; RSI is already trapnr */
+ 	call do_early_exception
+ 
+diff --git a/arch/x86/lib/usercopy_64.c b/arch/x86/lib/usercopy_64.c
+index 508c81e97ab1..c8c897c1078f 100644
+--- a/arch/x86/lib/usercopy_64.c
++++ b/arch/x86/lib/usercopy_64.c
+@@ -87,7 +87,12 @@ EXPORT_SYMBOL_GPL(arch_wb_cache_pmem);
+ long __copy_user_flushcache(void *dst, const void __user *src, unsigned size)
+ {
+ 	unsigned long flushed, dest = (unsigned long) dst;
+-	long rc = __copy_user_nocache(dst, src, size, 0);
++	
++	long rc;
++
++	ksmap_nesting_warning();
++
++	rc = __copy_user_nocache(dst, src, size, 0);
+ 
+ 	/*
+ 	 * __copy_user_nocache() uses non-temporal stores for the bulk
+diff --git a/arch/x86/mm/fault.c b/arch/x86/mm/fault.c
+index 525197381baa..7d6d48b64427 100644
+--- a/arch/x86/mm/fault.c
++++ b/arch/x86/mm/fault.c
+@@ -35,6 +35,8 @@
+ #define CREATE_TRACE_POINTS
+ #include <asm/trace/exceptions.h>
+ 
++#include <linux/ksmap.h>
++
+ /*
+  * Returns 0 if mmiotrace is disabled, or if the fault is not
+  * handled by mmiotrace:
+@@ -1171,6 +1173,11 @@ do_kern_addr_fault(struct pt_regs *regs, unsigned long hw_error_code,
+ 			return;
+ 	}
+ #endif
++	//if (!(regs->flags & X86_EFLAGS_AC)) {
++	//	//WARN_ON(true);
++	//	ksmap_disable_smap();
++	//	return;
++	//}
+ 
+ 	if (is_f00f_bug(regs, hw_error_code, address))
+ 		return;
+@@ -1524,6 +1531,5 @@ DEFINE_IDTENTRY_RAW_ERRORCODE(exc_page_fault)
+ 	instrumentation_begin();
+ 	handle_page_fault(regs, error_code, address);
+ 	instrumentation_end();
+-
+ 	irqentry_exit(regs, state);
+ }
+diff --git a/block/ioprio.c b/block/ioprio.c
+index 364d2294ba90..293040f48d10 100644
+--- a/block/ioprio.c
++++ b/block/ioprio.c
+@@ -40,12 +40,15 @@ int set_task_ioprio(struct task_struct *task, int ioprio)
+ 	const struct cred *cred = current_cred(), *tcred;
+ 
+ 	rcu_read_lock();
++	ksmap_disable_smap();
+ 	tcred = __task_cred(task);
+ 	if (!uid_eq(tcred->uid, cred->euid) &&
+ 	    !uid_eq(tcred->uid, cred->uid) && !capable(CAP_SYS_NICE)) {
++		ksmap_enable_smap();
+ 		rcu_read_unlock();
+ 		return -EPERM;
+ 	}
++	ksmap_enable_smap();
+ 	rcu_read_unlock();
+ 
+ 	err = security_task_setioprio(task, ioprio);
+diff --git a/certs/system_keyring.c b/certs/system_keyring.c
+index 4b693da488f1..a4122aa4f43d 100644
+--- a/certs/system_keyring.c
++++ b/certs/system_keyring.c
+@@ -97,6 +97,8 @@ static __init int system_trusted_keyring_init(void)
+ {
+ 	pr_notice("Initialise system trusted keyrings\n");
+ 
++	ksmap_disable_smap();
++
+ 	builtin_trusted_keys =
+ 		keyring_alloc(".builtin_trusted_keys",
+ 			      GLOBAL_ROOT_UID, GLOBAL_ROOT_GID, current_cred(),
+@@ -123,7 +125,9 @@ static __init int system_trusted_keyring_init(void)
+ 	if (key_link(secondary_trusted_keys, builtin_trusted_keys) < 0)
+ 		panic("Can't link trusted keyrings\n");
+ #endif
+-
++	
++	ksmap_enable_smap();
++	
+ 	return 0;
+ }
+ 
+diff --git a/fs/binfmt_elf.c b/fs/binfmt_elf.c
+index b12ba98ae9f5..2890391bc5ac 100644
+--- a/fs/binfmt_elf.c
++++ b/fs/binfmt_elf.c
+@@ -265,10 +265,12 @@ create_elf_tables(struct linux_binprm *bprm, const struct elfhdr *exec,
+ 		flags |= AT_FLAGS_PRESERVE_ARGV0;
+ 	NEW_AUX_ENT(AT_FLAGS, flags);
+ 	NEW_AUX_ENT(AT_ENTRY, e_entry);
++	ksmap_disable_smap();
+ 	NEW_AUX_ENT(AT_UID, from_kuid_munged(cred->user_ns, cred->uid));
+ 	NEW_AUX_ENT(AT_EUID, from_kuid_munged(cred->user_ns, cred->euid));
+ 	NEW_AUX_ENT(AT_GID, from_kgid_munged(cred->user_ns, cred->gid));
+ 	NEW_AUX_ENT(AT_EGID, from_kgid_munged(cred->user_ns, cred->egid));
++	ksmap_enable_smap();
+ 	NEW_AUX_ENT(AT_SECURE, bprm->secureexec);
+ 	NEW_AUX_ENT(AT_RANDOM, (elf_addr_t)(unsigned long)u_rand_bytes);
+ #ifdef ELF_HWCAP2
+diff --git a/fs/efivarfs/file.c b/fs/efivarfs/file.c
+index e6bc0302643b..b46d75b796ec 100644
+--- a/fs/efivarfs/file.c
++++ b/fs/efivarfs/file.c
+@@ -73,8 +73,10 @@ static ssize_t efivarfs_file_read(struct file *file, char __user *userbuf,
+ 	ssize_t size = 0;
+ 	int err;
+ 
++	ksmap_disable_smap();
+ 	while (!__ratelimit(&file->f_cred->user->ratelimit))
+ 		msleep(50);
++	ksmap_enable_smap();
+ 
+ 	err = efivar_entry_size(var, &datasize);
+ 
+diff --git a/fs/exec.c b/fs/exec.c
+index 18594f11c31f..3bdce6d756dd 100644
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@ -1345,13 +1345,17 @@ int begin_new_exec(struct linux_binprm * bprm)
+ 	 * is wrong, but userspace depends on it. This should be testing
+ 	 * bprm->secureexec instead.
+ 	 */
++	ksmap_disable_smap();
++
+ 	if (bprm->interp_flags & BINPRM_FLAGS_ENFORCE_NONDUMP ||
+-	    !(uid_eq(current_euid(), current_uid()) &&
+-	      gid_eq(current_egid(), current_gid())))
++	    !(uid_eq(current_euid_nosmap(), current_uid_nosmap()) &&
++	      gid_eq(current_egid_nosmap(), current_gid_nosmap())))
+ 		set_dumpable(current->mm, suid_dumpable);
+ 	else
+ 		set_dumpable(current->mm, SUID_DUMP_USER);
+ 
++	ksmap_enable_smap();
++
+ 	perf_event_exec();
+ 	__set_task_comm(me, kbasename(bprm->filename), true);
+ 
+@@ -1478,10 +1482,12 @@ static void free_bprm(struct linux_binprm *bprm)
+ 		mmput(bprm->mm);
+ 	}
+ 	free_arg_pages(bprm);
++	ksmap_disable_smap();
+ 	if (bprm->cred) {
+ 		mutex_unlock(&current->signal->cred_guard_mutex);
+-		abort_creds(bprm->cred);
++		abort_creds_nosmap(bprm->cred);
+ 	}
++	ksmap_enable_smap();
+ 	if (bprm->file) {
+ 		allow_write_access(bprm->file);
+ 		fput(bprm->file);
+@@ -1586,16 +1592,18 @@ static void bprm_fill_uid(struct linux_binprm *bprm, struct file *file)
+ 	kuid_t uid;
+ 	kgid_t gid;
+ 
++	ksmap_disable_smap();
++	
+ 	if (!mnt_may_suid(file->f_path.mnt))
+-		return;
++		goto out;
+ 
+ 	if (task_no_new_privs(current))
+-		return;
++		goto out;
+ 
+ 	inode = file->f_path.dentry->d_inode;
+ 	mode = READ_ONCE(inode->i_mode);
+ 	if (!(mode & (S_ISUID|S_ISGID)))
+-		return;
++		goto out;
+ 
+ 	mnt_userns = file_mnt_user_ns(file);
+ 
+@@ -1611,7 +1619,7 @@ static void bprm_fill_uid(struct linux_binprm *bprm, struct file *file)
+ 	/* We ignore suid/sgid if there are no mappings for them in the ns */
+ 	if (!kuid_has_mapping(bprm->cred->user_ns, uid) ||
+ 		 !kgid_has_mapping(bprm->cred->user_ns, gid))
+-		return;
++		goto out;
+ 
+ 	if (mode & S_ISUID) {
+ 		bprm->per_clear |= PER_CLEAR_ON_SETID;
+@@ -1622,6 +1630,10 @@ static void bprm_fill_uid(struct linux_binprm *bprm, struct file *file)
+ 		bprm->per_clear |= PER_CLEAR_ON_SETID;
+ 		bprm->cred->egid = gid;
+ 	}
++
++out:	
++	ksmap_enable_smap();
++	return;
+ }
+ 
+ /*
+diff --git a/fs/file_table.c b/fs/file_table.c
+index 45437f8e1003..dd9e06ae835d 100644
+--- a/fs/file_table.c
++++ b/fs/file_table.c
+@@ -46,7 +46,7 @@ static void file_free_rcu(struct rcu_head *head)
+ {
+ 	struct file *f = container_of(head, struct file, f_u.fu_rcuhead);
+ 
+-	put_cred(f->f_cred);
++	put_cred_nested(f->f_cred);
+ 	kmem_cache_free(filp_cachep, f);
+ }
+ 
+diff --git a/fs/fs_context.c b/fs/fs_context.c
+index 2834d1afa6e8..5ad85b56dbb8 100644
+--- a/fs/fs_context.c
++++ b/fs/fs_context.c
+@@ -247,7 +247,9 @@ static struct fs_context *alloc_fs_context(struct file_system_type *fs_type,
+ 
+ 	switch (purpose) {
+ 	case FS_CONTEXT_FOR_MOUNT:
++		ksmap_disable_smap();
+ 		fc->user_ns = get_user_ns(fc->cred->user_ns);
++		ksmap_enable_smap();
+ 		break;
+ 	case FS_CONTEXT_FOR_SUBMOUNT:
+ 		fc->user_ns = get_user_ns(reference->d_sb->s_user_ns);
+diff --git a/fs/namei.c b/fs/namei.c
+index 216f16e74351..89047d590417 100644
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -1019,8 +1019,12 @@ static inline int may_follow_link(struct nameidata *nd, const struct inode *inod
+ 	mnt_userns = mnt_user_ns(nd->path.mnt);
+ 	i_uid = i_uid_into_mnt(mnt_userns, inode);
+ 	/* Allowed if owner and follower match. */
+-	if (uid_eq(current_cred()->fsuid, i_uid))
++	ksmap_disable_smap();
++	if (uid_eq(current_cred()->fsuid, i_uid)) {
++		ksmap_enable_smap();
+ 		return 0;
++	}
++	ksmap_enable_smap();
+ 
+ 	/* Allowed if parent directory not sticky and world-writable. */
+ 	if ((nd->dir_mode & (S_ISVTX|S_IWOTH)) != (S_ISVTX|S_IWOTH))
+diff --git a/fs/nfs/nfs4idmap.c b/fs/nfs/nfs4idmap.c
+index 8d8aba305ecc..ac77d05be198 100644
+--- a/fs/nfs/nfs4idmap.c
++++ b/fs/nfs/nfs4idmap.c
+@@ -203,9 +203,12 @@ int nfs_idmap_init(void)
+ 	printk(KERN_NOTICE "NFS: Registering the %s key type\n",
+ 		key_type_id_resolver.name);
+ 
+-	cred = prepare_kernel_cred(NULL);
+-	if (!cred)
++	ksmap_disable_smap();
++	cred = prepare_kernel_cred_nosmap(NULL);
++	if (!cred) {
++		ksmap_enable_smap();
+ 		return -ENOMEM;
++	}
+ 
+ 	keyring = keyring_alloc(".id_resolver",
+ 				GLOBAL_ROOT_UID, GLOBAL_ROOT_GID, cred,
+@@ -229,6 +232,7 @@ int nfs_idmap_init(void)
+ 	cred->thread_keyring = keyring;
+ 	cred->jit_keyring = KEY_REQKEY_DEFL_THREAD_KEYRING;
+ 	id_resolver_cache = cred;
++	ksmap_enable_smap();
+ 	return 0;
+ 
+ failed_reg_legacy:
+@@ -236,7 +240,8 @@ int nfs_idmap_init(void)
+ failed_put_key:
+ 	key_put(keyring);
+ failed_put_cred:
+-	put_cred(cred);
++	put_cred_nosmap(cred);
++	ksmap_enable_smap();
+ 	return ret;
+ }
+ 
+diff --git a/fs/open.c b/fs/open.c
+index e53af13b5835..5979a3fe1886 100644
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -352,9 +352,13 @@ static const struct cred *access_override_creds(void)
+ 	const struct cred *old_cred;
+ 	struct cred *override_cred;
+ 
+-	override_cred = prepare_creds();
+-	if (!override_cred)
++	ksmap_disable_smap();
++
++	override_cred = prepare_creds_nosmap();
++	if (!override_cred) {
++		ksmap_enable_smap();
+ 		return NULL;
++	}
+ 
+ 	override_cred->fsuid = override_cred->uid;
+ 	override_cred->fsgid = override_cred->gid;
+@@ -388,11 +392,12 @@ static const struct cred *access_override_creds(void)
+ 	 */
+ 	override_cred->non_rcu = 1;
+ 
+-	old_cred = override_creds(override_cred);
++	old_cred = override_creds_nosmap(override_cred);
+ 
+ 	/* override_cred() gets its own ref */
+-	put_cred(override_cred);
++	put_cred_nosmap(override_cred);
+ 
++	ksmap_enable_smap();
+ 	return old_cred;
+ }
+ 
+diff --git a/fs/proc/array.c b/fs/proc/array.c
+index bb87e4d89cd8..619efe03b42d 100644
+--- a/fs/proc/array.c
++++ b/fs/proc/array.c
+@@ -190,6 +190,7 @@ static inline void task_state(struct seq_file *m, struct pid_namespace *ns,
+ 	seq_put_decimal_ull(m, "\nPid:\t", pid_nr_ns(pid, ns));
+ 	seq_put_decimal_ull(m, "\nPPid:\t", ppid);
+ 	seq_put_decimal_ull(m, "\nTracerPid:\t", tpid);
++	ksmap_disable_smap();
+ 	seq_put_decimal_ull(m, "\nUid:\t", from_kuid_munged(user_ns, cred->uid));
+ 	seq_put_decimal_ull(m, "\t", from_kuid_munged(user_ns, cred->euid));
+ 	seq_put_decimal_ull(m, "\t", from_kuid_munged(user_ns, cred->suid));
+@@ -205,7 +206,8 @@ static inline void task_state(struct seq_file *m, struct pid_namespace *ns,
+ 	for (g = 0; g < group_info->ngroups; g++)
+ 		seq_put_decimal_ull(m, g ? " " : "",
+ 				from_kgid_munged(user_ns, group_info->gid[g]));
+-	put_cred(cred);
++	put_cred_nosmap(cred);
++	ksmap_enable_smap();
+ 	/* Trailing space shouldn't have been added in the first place. */
+ 	seq_putc(m, ' ');
+ 
+@@ -284,7 +286,9 @@ static inline void task_sig(struct seq_file *m, struct task_struct *p)
+ 		collect_sigign_sigcatch(p, &ignored, &caught);
+ 		num_threads = get_nr_threads(p);
+ 		rcu_read_lock();  /* FIXME: is this correct? */
++		ksmap_disable_smap();
+ 		qsize = atomic_read(&__task_cred(p)->user->sigpending);
++		ksmap_enable_smap();
+ 		rcu_read_unlock();
+ 		qlim = task_rlimit(p, RLIMIT_SIGPENDING);
+ 		unlock_task_sighand(p, &flags);
+@@ -322,12 +326,14 @@ static inline void task_cap(struct seq_file *m, struct task_struct *p)
+ 			cap_bset, cap_ambient;
+ 
+ 	rcu_read_lock();
++	ksmap_disable_smap();
+ 	cred = __task_cred(p);
+ 	cap_inheritable	= cred->cap_inheritable;
+ 	cap_permitted	= cred->cap_permitted;
+ 	cap_effective	= cred->cap_effective;
+ 	cap_bset	= cred->cap_bset;
+ 	cap_ambient	= cred->cap_ambient;
++	ksmap_enable_smap();
+ 	rcu_read_unlock();
+ 
+ 	render_cap_t(m, "CapInh:\t", &cap_inheritable);
+diff --git a/fs/proc/base.c b/fs/proc/base.c
+index 56bf14316122..dc20ed16d9d8 100644
+--- a/fs/proc/base.c
++++ b/fs/proc/base.c
+@@ -1822,10 +1822,12 @@ void task_dump_owner(struct task_struct *task, umode_t mode,
+ 	kuid_t uid;
+ 	kgid_t gid;
+ 
++	ksmap_disable_smap();
++
+ 	if (unlikely(task->flags & PF_KTHREAD)) {
+ 		*ruid = GLOBAL_ROOT_UID;
+ 		*rgid = GLOBAL_ROOT_GID;
+-		return;
++		goto out;
+ 	}
+ 
+ 	/* Default to the tasks effective ownership */
+@@ -1868,6 +1870,8 @@ void task_dump_owner(struct task_struct *task, umode_t mode,
+ 	}
+ 	*ruid = uid;
+ 	*rgid = gid;
++out:
++	ksmap_enable_smap();
+ }
+ 
+ void proc_pid_evict_inode(struct proc_inode *ei)
+diff --git a/include/linux/capability.h b/include/linux/capability.h
+index 65efb74c3585..fd5b1852e504 100644
+--- a/include/linux/capability.h
++++ b/include/linux/capability.h
+@@ -208,9 +208,13 @@ extern bool has_capability_noaudit(struct task_struct *t, int cap);
+ extern bool has_ns_capability_noaudit(struct task_struct *t,
+ 				      struct user_namespace *ns, int cap);
+ extern bool capable(int cap);
++extern bool capable_nosmap(int cap);
+ extern bool ns_capable(struct user_namespace *ns, int cap);
++extern bool ns_capable_nosmap(struct user_namespace *ns, int cap);
+ extern bool ns_capable_noaudit(struct user_namespace *ns, int cap);
++extern bool ns_capable_noaudit_nosmap(struct user_namespace *ns, int cap);
+ extern bool ns_capable_setid(struct user_namespace *ns, int cap);
++extern bool ns_capable_setid_nosmap(struct user_namespace *ns, int cap);
+ #else
+ static inline bool has_capability(struct task_struct *t, int cap)
+ {
+diff --git a/include/linux/cred.h b/include/linux/cred.h
+index 18639c069263..85d3410c7981 100644
+--- a/include/linux/cred.h
++++ b/include/linux/cred.h
+@@ -16,6 +16,8 @@
+ #include <linux/sched.h>
+ #include <linux/sched/user.h>
+ 
++#include <linux/ksmap.h>
++
+ struct cred;
+ struct inode;
+ 
+@@ -150,20 +152,34 @@ struct cred {
+ 		int non_rcu;			/* Can we skip RCU deletion? */
+ 		struct rcu_head	rcu;		/* RCU deletion hook */
+ 	};
++	void *cred_rcu; // bck ref for ksmap
+ } __randomize_layout;
+ 
++struct cred_rcu {
++	struct cred *cred;
++	struct rcu_head rcu;
++};
++
+ extern void __put_cred(struct cred *);
+ extern void exit_creds(struct task_struct *);
++extern void exit_creds_nested(struct task_struct *);
+ extern int copy_creds(struct task_struct *, unsigned long);
+ extern const struct cred *get_task_cred(struct task_struct *);
++extern const struct cred *get_task_cred_nosmap(struct task_struct *);
+ extern struct cred *cred_alloc_blank(void);
+ extern struct cred *prepare_creds(void);
++extern struct cred *prepare_creds_nosmap(void);
+ extern struct cred *prepare_exec_creds(void);
+ extern int commit_creds(struct cred *);
++extern int commit_creds_nosmap(struct cred *);
+ extern void abort_creds(struct cred *);
++extern void abort_creds_nosmap(struct cred *);
+ extern const struct cred *override_creds(const struct cred *);
++extern const struct cred *override_creds_nosmap(const struct cred *);
+ extern void revert_creds(const struct cred *);
++extern void revert_creds_nosmap(const struct cred *);
+ extern struct cred *prepare_kernel_cred(struct task_struct *);
++extern struct cred *prepare_kernel_cred_nosmap(struct task_struct *);
+ extern int change_create_files_as(struct cred *, struct inode *);
+ extern int set_security_override(struct cred *, u32);
+ extern int set_security_override_from_ctx(struct cred *, const char *);
+@@ -244,17 +260,48 @@ static inline struct cred *get_new_cred(struct cred *cred)
+  * accidental alteration of a set of credentials that should be considered
+  * immutable.
+  */
+-static inline const struct cred *get_cred(const struct cred *cred)
++static inline const struct cred *get_cred_nosmap(const struct cred *cred)
+ {
+ 	struct cred *nonconst_cred = (struct cred *) cred;
+ 	if (!cred)
+ 		return cred;
+ 	validate_creds(cred);
+ 	nonconst_cred->non_rcu = 0;
+-	return get_new_cred(nonconst_cred);
++	atomic_inc(&nonconst_cred->usage);
++	return nonconst_cred;
++}
++
++static inline const struct cred *get_cred(const struct cred *cred)
++{
++	const struct cred *_cred;
++	
++	if (!cred)
++		return cred;
++
++	ksmap_disable_smap();
++	_cred = get_cred_nosmap(cred);
++	ksmap_enable_smap();
++
++	return _cred;
+ }
+ 
+ static inline const struct cred *get_cred_rcu(const struct cred *cred)
++{
++	struct cred *nonconst_cred = (struct cred *) cred;
++	if (!cred)
++		return NULL;
++	ksmap_disable_smap();
++	if (!atomic_inc_not_zero(&nonconst_cred->usage)) {
++		ksmap_enable_smap();
++		return NULL;
++	}
++	validate_creds(cred);
++	nonconst_cred->non_rcu = 0;
++	ksmap_enable_smap();
++	return cred;
++}
++
++static inline const struct cred *get_cred_rcu_nosmap(const struct cred *cred)
+ {
+ 	struct cred *nonconst_cred = (struct cred *) cred;
+ 	if (!cred)
+@@ -277,14 +324,42 @@ static inline const struct cred *get_cred_rcu(const struct cred *cred)
+  * on task_struct are attached by const pointers to prevent accidental
+  * alteration of otherwise immutable credential sets.
+  */
++static inline void put_cred_nosmap(const struct cred *_cred)
++{
++       struct cred *cred = (struct cred *) _cred;
++
++       if (cred) {
++               validate_creds(cred);
++               if (atomic_dec_and_test(&(cred)->usage))
++                       __put_cred(cred);
++       }
++}
++
+ static inline void put_cred(const struct cred *_cred)
+ {
+ 	struct cred *cred = (struct cred *) _cred;
+ 
+ 	if (cred) {
+ 		validate_creds(cred);
++		ksmap_disable_smap();
+ 		if (atomic_dec_and_test(&(cred)->usage))
+ 			__put_cred(cred);
++		ksmap_enable_smap();
++	}
++}
++static inline void put_cred_nested(const struct cred *_cred)
++{
++	struct cred *cred = (struct cred *) _cred;
++
++	if (cred) {
++		unsigned long eflags = native_save_fl();
++		validate_creds(cred);
++		if (!(eflags & X86_EFLAGS_AC))
++			ksmap_disable_smap();
++		if (atomic_dec_and_test(&(cred)->usage))
++			__put_cred(cred);
++		if (!(eflags & X86_EFLAGS_AC))
++			ksmap_enable_smap();
+ 	}
+ }
+ 
+@@ -329,6 +404,8 @@ static inline void put_cred(const struct cred *_cred)
+ #define get_current_cred()				\
+ 	(get_cred(current_cred()))
+ 
++#define get_current_cred_nosmap()				\
++	(get_cred_nosmap(current_cred()))
+ /**
+  * get_current_user - Get the current task's user_struct
+  *
+@@ -340,7 +417,9 @@ static inline void put_cred(const struct cred *_cred)
+ 	struct user_struct *__u;			\
+ 	const struct cred *__cred;			\
+ 	__cred = current_cred();			\
++	ksmap_disable_smap();				\
+ 	__u = get_uid(__cred->user);			\
++	ksmap_enable_smap();				\
+ 	__u;						\
+ })
+ 
+@@ -355,7 +434,9 @@ static inline void put_cred(const struct cred *_cred)
+ 	struct group_info *__groups;			\
+ 	const struct cred *__cred;			\
+ 	__cred = current_cred();			\
++	ksmap_disable_smap();						\
+ 	__groups = get_group_info(__cred->group_info);	\
++	ksmap_enable_smap();				\
+ 	__groups;					\
+ })
+ 
+@@ -363,17 +444,52 @@ static inline void put_cred(const struct cred *_cred)
+ ({							\
+ 	__typeof__(((struct cred *)NULL)->xxx) ___val;	\
+ 	rcu_read_lock();				\
++	ksmap_disable_smap();				\
+ 	___val = __task_cred((task))->xxx;		\
++	ksmap_enable_smap();				\
++	rcu_read_unlock();				\
++	___val;						\
++})
++
++#define task_cred_xxx_nested(task, xxx)			\
++({							\
++	unsigned long eflags = native_save_fl();	\
++	__typeof__(((struct cred *)NULL)->xxx) ___val;	\
++	rcu_read_lock();				\
++	if (!(eflags & X86_EFLAGS_AC))			\
++		ksmap_disable_smap();			\
++	___val = __task_cred((task))->xxx;		\
++	if (!(eflags & X86_EFLAGS_AC))			\
++		ksmap_enable_smap();			\
+ 	rcu_read_unlock();				\
+ 	___val;						\
+ })
+ 
+ #define task_uid(task)		(task_cred_xxx((task), uid))
++#define task_uid_nested(task)		(task_cred_xxx_nested((task), uid))
+ #define task_euid(task)		(task_cred_xxx((task), euid))
+ 
++#define current_cred_xxx_nosmap(xxx) current_cred()->xxx
++
+ #define current_cred_xxx(xxx)			\
+ ({						\
+-	current_cred()->xxx;			\
++	__typeof__(((struct cred *)NULL)->xxx) ___val;	\
++	ksmap_disable_smap();			\
++	___val = current_cred_xxx_nosmap(xxx);	\
++	ksmap_enable_smap();			\
++	___val;					\
++})
++
++#define current_cred_xxx_nested(xxx)			\
++({						\
++	unsigned long eflags = native_save_fl();	\
++	__typeof__(((struct cred *)NULL)->xxx) ___val;	\
++	if (!(eflags & X86_EFLAGS_AC))			\
++		ksmap_disable_smap();			\
++	___val = current_cred_xxx_nosmap(xxx);	\
++	if (!(eflags & X86_EFLAGS_AC))			\
++		ksmap_enable_smap();			\
++	___val;					\
+ })
+ 
+ #define current_uid()		(current_cred_xxx(uid))
+@@ -387,9 +503,21 @@ static inline void put_cred(const struct cred *_cred)
+ #define current_cap()		(current_cred_xxx(cap_effective))
+ #define current_user()		(current_cred_xxx(user))
+ 
++#define current_uid_nosmap()		(current_cred_xxx_nosmap(uid))
++#define current_gid_nosmap()		(current_cred_xxx_nosmap(gid))
++#define current_euid_nosmap()		(current_cred_xxx_nosmap(euid))
++#define current_egid_nosmap()		(current_cred_xxx_nosmap(egid))
++#define current_suid_nosmap()		(current_cred_xxx_nosmap(suid))
++#define current_sgid_nosmap()		(current_cred_xxx_nosmap(sgid))
++#define current_fsuid_nosmap() 	(current_cred_xxx_nosmap(fsuid))
++#define current_fsgid_nosmap() 	(current_cred_xxx_nosmap(fsgid))
++#define current_cap_nosmap()		(current_cred_xxx_nosmap(cap_effective))
++#define current_user_nosmap()		(current_cred_xxx_nosmap(user))
++
+ extern struct user_namespace init_user_ns;
+ #ifdef CONFIG_USER_NS
+ #define current_user_ns()	(current_cred_xxx(user_ns))
++#define current_user_ns_nosmap()	(current_cred_xxx_nosmap(user_ns))
+ #else
+ static inline struct user_namespace *current_user_ns(void)
+ {
+@@ -402,24 +530,30 @@ static inline struct user_namespace *current_user_ns(void)
+ do {						\
+ 	const struct cred *__cred;		\
+ 	__cred = current_cred();		\
++	ksmap_disable_smap();			\
+ 	*(_uid) = __cred->uid;			\
+ 	*(_gid) = __cred->gid;			\
++	ksmap_enable_smap();			\
+ } while(0)
+ 
+ #define current_euid_egid(_euid, _egid)		\
+ do {						\
+ 	const struct cred *__cred;		\
+ 	__cred = current_cred();		\
++	ksmap_disable_smap();			\
+ 	*(_euid) = __cred->euid;		\
+ 	*(_egid) = __cred->egid;		\
++	ksmap_enable_smap();			\
+ } while(0)
+ 
+ #define current_fsuid_fsgid(_fsuid, _fsgid)	\
+ do {						\
+ 	const struct cred *__cred;		\
+ 	__cred = current_cred();		\
++	ksmap_disable_smap();			\
+ 	*(_fsuid) = __cred->fsuid;		\
+ 	*(_fsgid) = __cred->fsgid;		\
++	ksmap_enable_smap();			\
+ } while(0)
+ 
+ #endif /* _LINUX_CRED_H */
+diff --git a/include/linux/exactfit.h b/include/linux/exactfit.h
+new file mode 100644
+index 000000000000..a61834b7909d
+--- /dev/null
++++ b/include/linux/exactfit.h
+@@ -0,0 +1,14 @@
++#ifndef _LINUX_EXACTFIT_H
++#define	_LINUX_EXACTFIT_H
++
++#include <linux/mm.h>
++#include <linux/module.h>
++#include <linux/slab.h>
++#include <linux/memory.h>
++
++void exactfit_init(void);
++void *exactfit_alloc(unsigned int size, gfp_t gfp_flags);
++void exactfit_free(void *address, unsigned int size);
++
++#endif /* _LINUX_EXACTFIT_H */
++
+diff --git a/include/linux/gfp.h b/include/linux/gfp.h
+index 80544d5c08e7..83a36e1059ff 100644
+--- a/include/linux/gfp.h
++++ b/include/linux/gfp.h
+@@ -41,8 +41,10 @@ struct vm_area_struct;
+ #define ___GFP_ACCOUNT		0x400000u
+ #ifdef CONFIG_LOCKDEP
+ #define ___GFP_NOLOCKDEP	0x800000u
++#define ___GFP_KSMAP		0x1000000u
+ #else
+ #define ___GFP_NOLOCKDEP	0
++#define ___GFP_KSMAP		0x800000u
+ #endif
+ /* If the above are modified, __GFP_BITS_SHIFT may need updating */
+ 
+@@ -224,7 +226,7 @@ struct vm_area_struct;
+ #define __GFP_NOLOCKDEP ((__force gfp_t)___GFP_NOLOCKDEP)
+ 
+ /* Room for N __GFP_FOO bits */
+-#define __GFP_BITS_SHIFT (23 + IS_ENABLED(CONFIG_LOCKDEP))
++#define __GFP_BITS_SHIFT (24 + IS_ENABLED(CONFIG_LOCKDEP))
+ #define __GFP_BITS_MASK ((__force gfp_t)((1 << __GFP_BITS_SHIFT) - 1))
+ 
+ /**
+@@ -310,6 +312,8 @@ struct vm_area_struct;
+ 			 __GFP_NOMEMALLOC | __GFP_NOWARN) & ~__GFP_RECLAIM)
+ #define GFP_TRANSHUGE	(GFP_TRANSHUGE_LIGHT | __GFP_DIRECT_RECLAIM)
+ 
++#define GFP_KSMAP ___GFP_KSMAP
++
+ /* Convert GFP flags to their corresponding migrate type */
+ #define GFP_MOVABLE_MASK (__GFP_RECLAIMABLE|__GFP_MOVABLE)
+ #define GFP_MOVABLE_SHIFT 3
+diff --git a/include/linux/key.h b/include/linux/key.h
+index 7febc4881363..affb70a15016 100644
+--- a/include/linux/key.h
++++ b/include/linux/key.h
+@@ -282,6 +282,14 @@ extern struct key *key_alloc(struct key_type *type,
+ 			     unsigned long flags,
+ 			     struct key_restriction *restrict_link);
+ 
++extern struct key *key_alloc_nosmap(struct key_type *type,
++			     const char *desc,
++			     kuid_t uid, kgid_t gid,
++			     const struct cred *cred,
++			     key_perm_t perm,
++			     unsigned long flags,
++			     struct key_restriction *restrict_link);
++
+ 
+ #define KEY_ALLOC_IN_QUOTA		0x0000	/* add to quota, reject if would overrun */
+ #define KEY_ALLOC_QUOTA_OVERRUN		0x0001	/* add to quota, permit even if overrun */
+diff --git a/include/linux/ksmap.h b/include/linux/ksmap.h
+new file mode 100644
+index 000000000000..ff677a9ed94c
+--- /dev/null
++++ b/include/linux/ksmap.h
+@@ -0,0 +1,55 @@
++#ifndef _LINUX_KSMAP_H
++#define _LINUX_KSMAP_H
++
++#define ksmap__ASM_CLAC	".byte 0x0f,0x01,0xca"
++#define ksmap__ASM_STAC	".byte 0x0f,0x01,0xcb"
++
++static __always_inline void ksmap_stac(void)
++{
++	__asm__("stac");
++}
++
++static __always_inline void ksmap_clac(void)
++{
++	__asm__("clac");
++}
++
++static __always_inline void ksmap_nesting_warning(void)
++{
++	//unsigned long eflags = native_save_fl();
++
++	///* This should be cleared */
++	//WARN_ON(eflags & X86_EFLAGS_AC);
++}
++
++/*
++ * The following two functions _have_ to be always inlined, otherwise objtool
++ * complains about UACCESS being disabled after function return.
++ * 
++ */
++static __always_inline void ksmap_disable_smap(void)
++{
++	//unsigned long eflags = native_save_fl();
++
++	///* This should be cleared */
++	//WARN_ON(eflags & X86_EFLAGS_AC);
++	
++	// no need to worry about spec execution here
++	// as ksmap is entirely used to access addresses
++	// that are not user-controlled
++	ksmap_stac();
++}
++
++static __always_inline void ksmap_enable_smap(void)
++{
++	ksmap_clac();
++}
++
++void __init ksmap_init(void);
++
++void ksmap_verify_va(uint64_t va);
++struct page *ksmap_get_isolated_pages(unsigned int order);
++
++void ksmap_free_isolated_pages(struct page *page, unsigned int order);
++
++#endif /* _LINUX_KSMAP_H */
+diff --git a/include/linux/lsm_hook_defs.h b/include/linux/lsm_hook_defs.h
+index 477a597db013..445395becf38 100644
+--- a/include/linux/lsm_hook_defs.h
++++ b/include/linux/lsm_hook_defs.h
+@@ -43,6 +43,8 @@ LSM_HOOK(int, 0, capset, struct cred *new, const struct cred *old,
+ 	 const kernel_cap_t *permitted)
+ LSM_HOOK(int, 0, capable, const struct cred *cred, struct user_namespace *ns,
+ 	 int cap, unsigned int opts)
++LSM_HOOK(int, 0, capable_nosmap, const struct cred *cred, struct user_namespace *ns,
++	 int cap, unsigned int opts)
+ LSM_HOOK(int, 0, quotactl, int cmds, int type, int id, struct super_block *sb)
+ LSM_HOOK(int, 0, quota_on, struct dentry *dentry)
+ LSM_HOOK(int, 0, syslog, int type)
+@@ -365,6 +367,8 @@ LSM_HOOK(int, 0, xfrm_decode_session, struct sk_buff *skb, u32 *secid,
+ #ifdef CONFIG_KEYS
+ LSM_HOOK(int, 0, key_alloc, struct key *key, const struct cred *cred,
+ 	 unsigned long flags)
++LSM_HOOK(int, 0, key_alloc_nosmap, struct key *key, const struct cred *cred,
++	 unsigned long flags)
+ LSM_HOOK(void, LSM_RET_VOID, key_free, struct key *key)
+ LSM_HOOK(int, 0, key_permission, key_ref_t key_ref, const struct cred *cred,
+ 	 enum key_need_perm need_perm)
+diff --git a/include/linux/page-flags.h b/include/linux/page-flags.h
+index ec5d0290e0ee..9ab01df4fe7a 100644
+--- a/include/linux/page-flags.h
++++ b/include/linux/page-flags.h
+@@ -716,6 +716,7 @@ PAGEFLAG_FALSE(DoubleMap)
+ #define PG_offline	0x00000100
+ #define PG_table	0x00000200
+ #define PG_guard	0x00000400
++#define PG_ksmap        0x00000800
+ 
+ #define PageType(page, flag)						\
+ 	((page->page_type & (PAGE_TYPE_BASE | flag)) == PAGE_TYPE_BASE)
+@@ -747,6 +748,12 @@ static __always_inline void __ClearPage##uname(struct page *page)	\
+  */
+ PAGE_TYPE_OPS(Buddy, buddy)
+ 
++/*                                                                      
++ * PageKsmapBuddy() indicates that the smap isolated page is free and in
++ * the system the ksmap allocator uses                                  
++ */     
++PAGE_TYPE_OPS(Ksmap, ksmap)                                             
++
+ /*
+  * PageOffline() indicates that the page is logically offline although the
+  * containing section is online. (e.g. inflated in a balloon driver or
+diff --git a/include/linux/percpu.h b/include/linux/percpu.h
+index 5e76af742c80..8994c32c212b 100644
+--- a/include/linux/percpu.h
++++ b/include/linux/percpu.h
+@@ -133,6 +133,7 @@ extern void __init setup_per_cpu_areas(void);
+ 
+ extern void __percpu *__alloc_percpu_gfp(size_t size, size_t align, gfp_t gfp);
+ extern void __percpu *__alloc_percpu(size_t size, size_t align);
++extern void __percpu *__alloc_percpu_ksmap(size_t size, size_t align);
+ extern void free_percpu(void __percpu *__pdata);
+ extern phys_addr_t per_cpu_ptr_to_phys(void *addr);
+ 
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 26f499810dfa..c3935d325d0e 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -646,6 +646,12 @@ struct kmap_ctrl {
+ #endif
+ };
+ 
++#define KSMAP_STACK_SIZE 1024
++struct ksmap_iret_stack {
++	char stack[KSMAP_STACK_SIZE - 8];
++	struct task_struct *tsk_bck_ref;
++} __packed __attribute__((__aligned__(KSMAP_STACK_SIZE)));
++
+ struct task_struct {
+ #ifdef CONFIG_THREAD_INFO_IN_TASK
+ 	/*
+@@ -1368,6 +1374,8 @@ struct task_struct {
+ 	struct llist_head               kretprobe_instances;
+ #endif
+ 
++	struct ksmap_iret_stack 	*ksmap_iret_stack;
++
+ 	/*
+ 	 * New fields for task_struct should be added above here, so that
+ 	 * they are included in the randomized portion of task_struct.
+diff --git a/include/linux/securebits.h b/include/linux/securebits.h
+index 656528673983..65469956f558 100644
+--- a/include/linux/securebits.h
++++ b/include/linux/securebits.h
+@@ -4,5 +4,5 @@
+ 
+ #include <uapi/linux/securebits.h>
+ 
+-#define issecure(X)		(issecure_mask(X) & current_cred_xxx(securebits))
++#define issecure(X)		(issecure_mask(X) & current_cred_xxx_nosmap(securebits))
+ #endif /* !_LINUX_SECUREBITS_H */
+diff --git a/include/linux/security.h b/include/linux/security.h
+index 8aeebd6646dc..047cb12e11b6 100644
+--- a/include/linux/security.h
++++ b/include/linux/security.h
+@@ -136,6 +136,8 @@ extern const char *const lockdown_reasons[LOCKDOWN_CONFIDENTIALITY_MAX+1];
+ /* These functions are in security/commoncap.c */
+ extern int cap_capable(const struct cred *cred, struct user_namespace *ns,
+ 		       int cap, unsigned int opts);
++extern int cap_capable_nosmap(const struct cred *cred, struct user_namespace *ns,
++		       int cap, unsigned int opts);
+ extern int cap_settime(const struct timespec64 *ts, const struct timezone *tz);
+ extern int cap_ptrace_access_check(struct task_struct *child, unsigned int mode);
+ extern int cap_ptrace_traceme(struct task_struct *parent);
+@@ -278,6 +280,10 @@ int security_capable(const struct cred *cred,
+ 		       struct user_namespace *ns,
+ 		       int cap,
+ 		       unsigned int opts);
++int security_capable_nosmap(const struct cred *cred,
++		       struct user_namespace *ns,
++		       int cap,
++		       unsigned int opts);
+ int security_quotactl(int cmds, int type, int id, struct super_block *sb);
+ int security_quota_on(struct dentry *dentry);
+ int security_syslog(int type);
+@@ -564,6 +570,14 @@ static inline int security_capable(const struct cred *cred,
+ 	return cap_capable(cred, ns, cap, opts);
+ }
+ 
++static inline int security_capable_nosmap(const struct cred *cred,
++				   struct user_namespace *ns,
++				   int cap,
++				   unsigned int opts)
++{
++	return cap_capable_nosmap(cred, ns, cap, opts);
++}
++
+ static inline int security_quotactl(int cmds, int type, int id,
+ 				     struct super_block *sb)
+ {
+@@ -1825,6 +1839,7 @@ static inline int security_path_chroot(const struct path *path)
+ #ifdef CONFIG_SECURITY
+ 
+ int security_key_alloc(struct key *key, const struct cred *cred, unsigned long flags);
++int security_key_alloc_nosmap(struct key *key, const struct cred *cred, unsigned long flags);
+ void security_key_free(struct key *key);
+ int security_key_permission(key_ref_t key_ref, const struct cred *cred,
+ 			    enum key_need_perm need_perm);
+@@ -1839,6 +1854,13 @@ static inline int security_key_alloc(struct key *key,
+ 	return 0;
+ }
+ 
++static inline int security_key_alloc_nosmap(struct key *key,
++				     const struct cred *cred,
++				     unsigned long flags)
++{
++	return 0;
++}
++
+ static inline void security_key_free(struct key *key)
+ {
+ }
+diff --git a/include/linux/slab.h b/include/linux/slab.h
+index 7ae604076767..6cc7ad7c65a8 100644
+--- a/include/linux/slab.h
++++ b/include/linux/slab.h
+@@ -120,6 +120,12 @@
+ /* Slab deactivation flag */
+ #define SLAB_DEACTIVATED	((slab_flags_t __force)0x10000000U)
+ 
++#ifdef CONFIG_KSMAP
++#define SLAB_KSMAP      ((slab_flags_t __force)0x20000000U)
++#else    
++#define SLAB_KSMAP 0x0
++#endif           
++
+ /*
+  * ZERO_SIZE_PTR will be returned for zero sized kmalloc requests.
+  *
+diff --git a/include/linux/uaccess.h b/include/linux/uaccess.h
+index c7c6e8b8344d..aae9d12ded0d 100644
+--- a/include/linux/uaccess.h
++++ b/include/linux/uaccess.h
+@@ -188,6 +188,8 @@ _copy_to_user(void __user *, const void *, unsigned long);
+ static __always_inline unsigned long __must_check
+ copy_from_user(void *to, const void __user *from, unsigned long n)
+ {
++	ksmap_nesting_warning();
++
+ 	if (likely(check_copy_size(to, n, false)))
+ 		n = _copy_from_user(to, from, n);
+ 	return n;
+@@ -196,6 +198,8 @@ copy_from_user(void *to, const void __user *from, unsigned long n)
+ static __always_inline unsigned long __must_check
+ copy_to_user(void __user *to, const void *from, unsigned long n)
+ {
++	ksmap_nesting_warning();
++
+ 	if (likely(check_copy_size(from, n, true)))
+ 		n = _copy_to_user(to, from, n);
+ 	return n;
+diff --git a/init/init_task.c b/init/init_task.c
+index 3711cdaafed2..1b3e547f40e9 100644
+--- a/init/init_task.c
++++ b/init/init_task.c
+@@ -57,6 +57,11 @@ unsigned long init_shadow_call_stack[SCS_SIZE / sizeof(long)]
+ };
+ #endif
+ 
++// TODO ksmap: protect this with ksmap?
++struct ksmap_iret_stack init_ksmap_iret_stack = {
++	.tsk_bck_ref = &init_task,
++};
++
+ /*
+  * Set up the first task table, touch at your own risk!. Base=0,
+  * limit=0x1fffff (=2MB)
+@@ -213,6 +218,7 @@ struct task_struct init_task
+ #ifdef CONFIG_SECCOMP
+ 	.seccomp	= { .filter_count = ATOMIC_INIT(0) },
+ #endif
++	.ksmap_iret_stack = (struct ksmap_iret_stack *)&init_ksmap_iret_stack.tsk_bck_ref,
+ };
+ EXPORT_SYMBOL(init_task);
+ 
+diff --git a/init/main.c b/init/main.c
+index a626e78dbf06..f362b08cd772 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -109,6 +109,8 @@
+ 
+ #include <kunit/test.h>
+ 
++#include <linux/ksmap.h>
++
+ static int kernel_init(void *);
+ 
+ extern void init_IRQ(void);
+@@ -826,7 +828,10 @@ static void __init mm_init(void)
+ 	page_ext_init_flatmem();
+ 	init_mem_debugging_and_hardening();
+ 	report_meminit();
+-	mem_init();
++	mem_init();	
++#ifdef CONFIG_KSMAP 
++        ksmap_init();
++#endif
+ 	/* page_owner must be initialized after buddy is ready */
+ 	page_ext_init_flatmem_late();
+ 	kmem_cache_init();
+@@ -1527,6 +1532,11 @@ static noinline void __init kernel_init_freeable(void)
+ 
+ 	padata_init();
+ 	page_alloc_init_late();
++
++#ifdef CONFIG_KSMAP
++	identify_boot_cpu_late();
++#endif
++
+ 	/* Initialize page ext after all struct pages are initialized. */
+ 	page_ext_init();
+ 
+diff --git a/kernel/capability.c b/kernel/capability.c
+index 46a361dde042..dc02babff431 100644
+--- a/kernel/capability.c
++++ b/kernel/capability.c
+@@ -361,7 +361,7 @@ bool has_capability_noaudit(struct task_struct *t, int cap)
+ 	return has_ns_capability_noaudit(t, &init_user_ns, cap);
+ }
+ 
+-static bool ns_capable_common(struct user_namespace *ns,
++static inline bool __ns_capable_common(struct user_namespace *ns,
+ 			      int cap,
+ 			      unsigned int opts)
+ {
+@@ -372,7 +372,7 @@ static bool ns_capable_common(struct user_namespace *ns,
+ 		BUG();
+ 	}
+ 
+-	capable = security_capable(current_cred(), ns, cap, opts);
++	capable = security_capable_nosmap(current_cred(), ns, cap, opts);
+ 	if (capable == 0) {
+ 		current->flags |= PF_SUPERPRIV;
+ 		return true;
+@@ -380,6 +380,26 @@ static bool ns_capable_common(struct user_namespace *ns,
+ 	return false;
+ }
+ 
++static bool ns_capable_common(struct user_namespace *ns,
++			      int cap,
++			      unsigned int opts)
++{
++	bool rc;
++
++	ksmap_disable_smap();
++	rc = __ns_capable_common(ns, cap, opts);
++	ksmap_enable_smap();
++
++	return rc;
++}
++
++static bool ns_capable_common_nosmap(struct user_namespace *ns,
++			      int cap,
++			      unsigned int opts)
++{
++	return __ns_capable_common(ns, cap, opts);
++}
++
+ /**
+  * ns_capable - Determine if the current task has a superior capability in effect
+  * @ns:  The usernamespace we want the capability in
+@@ -397,6 +417,12 @@ bool ns_capable(struct user_namespace *ns, int cap)
+ }
+ EXPORT_SYMBOL(ns_capable);
+ 
++bool ns_capable_nosmap(struct user_namespace *ns, int cap)
++{
++	return ns_capable_common_nosmap(ns, cap, CAP_OPT_NONE);
++}
++EXPORT_SYMBOL(ns_capable_nosmap);
++
+ /**
+  * ns_capable_noaudit - Determine if the current task has a superior capability
+  * (unaudited) in effect
+@@ -415,6 +441,12 @@ bool ns_capable_noaudit(struct user_namespace *ns, int cap)
+ }
+ EXPORT_SYMBOL(ns_capable_noaudit);
+ 
++bool ns_capable_noaudit_nosmap(struct user_namespace *ns, int cap)
++{
++	return ns_capable_common_nosmap(ns, cap, CAP_OPT_NOAUDIT);
++}
++EXPORT_SYMBOL(ns_capable_noaudit_nosmap);
++
+ /**
+  * ns_capable_setid - Determine if the current task has a superior capability
+  * in effect, while signalling that this check is being done from within a
+@@ -428,12 +460,25 @@ EXPORT_SYMBOL(ns_capable_noaudit);
+  * This sets PF_SUPERPRIV on the task if the capability is available on the
+  * assumption that it's about to be used.
+  */
++static inline bool __ns_capable_setid(struct user_namespace *ns, int cap)
++{
++	return ns_capable_common(ns, cap, CAP_OPT_INSETID);
++}
++
++
+ bool ns_capable_setid(struct user_namespace *ns, int cap)
+ {
+ 	return ns_capable_common(ns, cap, CAP_OPT_INSETID);
+ }
+ EXPORT_SYMBOL(ns_capable_setid);
+ 
++bool ns_capable_setid_nosmap(struct user_namespace *ns, int cap)
++{
++	return ns_capable_common_nosmap(ns, cap, CAP_OPT_INSETID);
++}
++EXPORT_SYMBOL(ns_capable_setid_nosmap);
++
++
+ /**
+  * capable - Determine if the current task has a superior capability in effect
+  * @cap: The capability to be tested for
+@@ -449,6 +494,13 @@ bool capable(int cap)
+ 	return ns_capable(&init_user_ns, cap);
+ }
+ EXPORT_SYMBOL(capable);
++
++bool capable_nosmap(int cap)
++{
++	return ns_capable_nosmap(&init_user_ns, cap);
++}
++EXPORT_SYMBOL(capable_nosmap);
++
+ #endif /* CONFIG_MULTIUSER */
+ 
+ /**
+@@ -527,7 +579,7 @@ bool ptracer_capable(struct task_struct *tsk, struct user_namespace *ns)
+ 	rcu_read_lock();
+ 	cred = rcu_dereference(tsk->ptracer_cred);
+ 	if (cred)
+-		ret = security_capable(cred, ns, CAP_SYS_PTRACE,
++		ret = security_capable_nosmap(cred, ns, CAP_SYS_PTRACE,
+ 				       CAP_OPT_NOAUDIT);
+ 	rcu_read_unlock();
+ 	return (ret == 0);
+diff --git a/kernel/cred.c b/kernel/cred.c
+index 421b1149c651..84d5c3df664b 100644
+--- a/kernel/cred.c
++++ b/kernel/cred.c
+@@ -30,7 +30,8 @@ do {									\
+ } while (0)
+ #endif
+ 
+-static struct kmem_cache *cred_jar;
++static __ro_after_init struct kmem_cache *cred_jar;
++static __ro_after_init struct kmem_cache *cred_rcu_jar;
+ 
+ /* init to 2 - one for init_task, one to ensure it is never freed */
+ struct group_info init_groups = { .usage = ATOMIC_INIT(2) };
+@@ -90,10 +91,8 @@ static inline void alter_cred_subscribers(const struct cred *_cred, int n)
+ /*
+  * The RCU callback to actually dispose of a set of credentials
+  */
+-static void put_cred_rcu(struct rcu_head *rcu)
++static void put_cred_norcu(struct cred *cred)
+ {
+-	struct cred *cred = container_of(rcu, struct cred, rcu);
+-
+ 	kdebug("put_cred_rcu(%p)", cred);
+ 
+ #ifdef CONFIG_DEBUG_CREDENTIALS
+@@ -120,9 +119,32 @@ static void put_cred_rcu(struct rcu_head *rcu)
+ 		put_group_info(cred->group_info);
+ 	free_uid(cred->user);
+ 	put_user_ns(cred->user_ns);
++	
+ 	kmem_cache_free(cred_jar, cred);
+ }
+ 
++static void put_cred_rcu(struct rcu_head *rcu)
++{
++	struct cred *cred;
++	struct cred_rcu *cred_rcu;
++	unsigned long eflags;
++
++	cred_rcu = container_of(rcu, struct cred_rcu, rcu);
++
++	cred = cred_rcu->cred;
++
++	eflags = native_save_fl();
++	if (!(eflags & X86_EFLAGS_AC))
++		ksmap_disable_smap();
++	BUG_ON(unlikely(cred->cred_rcu != cred_rcu));
++	ksmap_verify_va(cred);
++	put_cred_norcu(cred);
++	if (!(eflags & X86_EFLAGS_AC))
++		ksmap_enable_smap();
++
++	kmem_cache_free(cred_rcu_jar, cred_rcu);
++}
++
+ /**
+  * __put_cred - Destroy a set of credentials
+  * @cred: The record to release
+@@ -136,6 +158,7 @@ void __put_cred(struct cred *cred)
+ 	       read_cred_subscribers(cred));
+ 
+ 	BUG_ON(atomic_read(&cred->usage) != 0);
++
+ #ifdef CONFIG_DEBUG_CREDENTIALS
+ 	BUG_ON(read_cred_subscribers(cred) != 0);
+ 	cred->magic = CRED_MAGIC_DEAD;
+@@ -145,9 +168,13 @@ void __put_cred(struct cred *cred)
+ 	BUG_ON(cred == current->real_cred);
+ 
+ 	if (cred->non_rcu)
+-		put_cred_rcu(&cred->rcu);
+-	else
+-		call_rcu(&cred->rcu, put_cred_rcu);
++		put_cred_norcu(cred);
++	else {
++		struct cred_rcu *cred_rcu = kmem_cache_alloc(cred_rcu_jar, 0);
++		cred_rcu->cred = cred;
++		cred->cred_rcu = cred_rcu;
++		call_rcu(&cred_rcu->rcu, put_cred_rcu);
++	}
+ }
+ EXPORT_SYMBOL(__put_cred);
+ 
+@@ -166,18 +193,55 @@ void exit_creds(struct task_struct *tsk)
+ 	tsk->real_cred = NULL;
+ 	validate_creds(cred);
+ 	alter_cred_subscribers(cred, -1);
+-	put_cred(cred);
++	ksmap_disable_smap();
++	put_cred_nosmap(cred);
+ 
+ 	cred = (struct cred *) tsk->cred;
+ 	tsk->cred = NULL;
+ 	validate_creds(cred);
+ 	alter_cred_subscribers(cred, -1);
+-	put_cred(cred);
++	
++	put_cred_nosmap(cred);
+ 
+ #ifdef CONFIG_KEYS_REQUEST_CACHE
+ 	key_put(tsk->cached_requested_key);
+ 	tsk->cached_requested_key = NULL;
+ #endif
++	ksmap_enable_smap();
++}
++
++void exit_creds_nested(struct task_struct *tsk)
++{
++	struct cred *cred;
++	unsigned long eflags;	
++
++	kdebug("exit_creds(%u,%p,%p,{%d,%d})", tsk->pid, tsk->real_cred, tsk->cred,
++	       atomic_read(&tsk->cred->usage),
++	       read_cred_subscribers(tsk->cred));
++
++	cred = (struct cred *) tsk->real_cred;
++	tsk->real_cred = NULL;
++	validate_creds(cred);
++	alter_cred_subscribers(cred, -1);
++	
++	eflags = native_save_fl();
++	if (!(eflags & X86_EFLAGS_AC))
++		ksmap_disable_smap();
++	put_cred_nosmap(cred);
++
++	cred = (struct cred *) tsk->cred;
++	tsk->cred = NULL;
++	validate_creds(cred);
++	alter_cred_subscribers(cred, -1);
++	
++	put_cred_nosmap(cred);
++
++#ifdef CONFIG_KEYS_REQUEST_CACHE
++	key_put(tsk->cached_requested_key);
++	tsk->cached_requested_key = NULL;
++#endif
++	if (!(eflags & X86_EFLAGS_AC))
++		ksmap_enable_smap();
+ }
+ 
+ /**
+@@ -190,7 +254,7 @@ void exit_creds(struct task_struct *tsk)
+  * The caller must also make sure task doesn't get deleted, either by holding a
+  * ref on task or by holding tasklist_lock to prevent it from being unlinked.
+  */
+-const struct cred *get_task_cred(struct task_struct *task)
++static inline const struct cred *__get_task_cred(struct task_struct *task)
+ {
+ 	const struct cred *cred;
+ 
+@@ -199,11 +263,28 @@ const struct cred *get_task_cred(struct task_struct *task)
+ 	do {
+ 		cred = __task_cred((task));
+ 		BUG_ON(!cred);
+-	} while (!get_cred_rcu(cred));
++	} while (!get_cred_rcu_nosmap(cred));
+ 
+ 	rcu_read_unlock();
+ 	return cred;
+ }
++
++const struct cred *get_task_cred_nosmap(struct task_struct *task)
++{
++	return __get_task_cred(task);
++}
++EXPORT_SYMBOL(get_task_cred_nosmap);
++
++const struct cred *get_task_cred(struct task_struct *task)
++{
++	const struct cred *cred;
++
++	ksmap_disable_smap();
++	cred = __get_task_cred(task);
++	ksmap_enable_smap();
++
++	return cred;
++}
+ EXPORT_SYMBOL(get_task_cred);
+ 
+ /*
+@@ -247,7 +328,7 @@ struct cred *cred_alloc_blank(void)
+  *
+  * Call commit_creds() or abort_creds() to clean up.
+  */
+-struct cred *prepare_creds(void)
++static inline struct cred *__prepare_creds(void)
+ {
+ 	struct task_struct *task = current;
+ 	const struct cred *old;
+@@ -288,11 +369,25 @@ struct cred *prepare_creds(void)
+ 	return new;
+ 
+ error:
+-	abort_creds(new);
++	abort_creds_nosmap(new);
+ 	return NULL;
+ }
+-EXPORT_SYMBOL(prepare_creds);
+ 
++struct cred *prepare_creds_nosmap(void)
++{
++	return __prepare_creds();
++}
++EXPORT_SYMBOL(prepare_creds_nosmap);
++
++struct cred *prepare_creds(void)
++{
++	struct cred *new;
++	ksmap_disable_smap();
++	new = __prepare_creds();
++	ksmap_enable_smap();
++	return new; 
++}
++EXPORT_SYMBOL(prepare_creds);
+ /*
+  * Prepare credentials for current to perform an execve()
+  * - The caller must hold ->cred_guard_mutex
+@@ -301,9 +396,11 @@ struct cred *prepare_exec_creds(void)
+ {
+ 	struct cred *new;
+ 
+-	new = prepare_creds();
++	ksmap_disable_smap();
++
++	new = prepare_creds_nosmap();
+ 	if (!new)
+-		return new;
++		goto out;
+ 
+ #ifdef CONFIG_KEYS
+ 	/* newly exec'd tasks don't get a thread keyring */
+@@ -318,6 +415,8 @@ struct cred *prepare_exec_creds(void)
+ 	new->suid = new->fsuid = new->euid;
+ 	new->sgid = new->fsgid = new->egid;
+ 
++out:
++	ksmap_enable_smap();
+ 	return new;
+ }
+ 
+@@ -345,8 +444,8 @@ int copy_creds(struct task_struct *p, unsigned long clone_flags)
+ #endif
+ 		clone_flags & CLONE_THREAD
+ 	    ) {
+-		p->real_cred = get_cred(p->cred);
+-		get_cred(p->cred);
++		p->real_cred = get_cred_nosmap(p->cred);
++		get_cred_nosmap(p->cred);
+ 		alter_cred_subscribers(p->cred, 2);
+ 		kdebug("share_creds(%p{%d,%d})",
+ 		       p->cred, atomic_read(&p->cred->usage),
+@@ -355,7 +454,7 @@ int copy_creds(struct task_struct *p, unsigned long clone_flags)
+ 		return 0;
+ 	}
+ 
+-	new = prepare_creds();
++	new = prepare_creds_nosmap();
+ 	if (!new)
+ 		return -ENOMEM;
+ 
+@@ -385,13 +484,13 @@ int copy_creds(struct task_struct *p, unsigned long clone_flags)
+ #endif
+ 
+ 	atomic_inc(&new->user->processes);
+-	p->cred = p->real_cred = get_cred(new);
++	p->cred = p->real_cred = get_cred_nosmap(new);
+ 	alter_cred_subscribers(new, 2);
+ 	validate_creds(new);
+ 	return 0;
+ 
+ error_put:
+-	put_cred(new);
++	put_cred_nosmap(new);
+ 	return ret;
+ }
+ 
+@@ -434,7 +533,7 @@ static bool cred_cap_issubset(const struct cred *set, const struct cred *subset)
+  * Always returns 0 thus allowing this function to be tail-called at the end
+  * of, say, sys_setgid().
+  */
+-int commit_creds(struct cred *new)
++static inline int __commit_creds(struct cred *new)
+ {
+ 	struct task_struct *task = current;
+ 	const struct cred *old = task->real_cred;
+@@ -451,7 +550,7 @@ int commit_creds(struct cred *new)
+ #endif
+ 	BUG_ON(atomic_read(&new->usage) < 1);
+ 
+-	get_cred(new); /* we will require a ref for the subj creds too */
++	get_cred_nosmap(new); /* we will require a ref for the subj creds too */
+ 
+ 	/* dumpability changes */
+ 	if (!uid_eq(old->euid, new->euid) ||
+@@ -507,12 +606,30 @@ int commit_creds(struct cred *new)
+ 		proc_id_connector(task, PROC_EVENT_GID);
+ 
+ 	/* release the old obj and subj refs both */
+-	put_cred(old);
+-	put_cred(old);
++	put_cred_nosmap(old);
++	put_cred_nosmap(old);
+ 	return 0;
+ }
++
++int commit_creds(struct cred *new)
++{
++	int rc;
++
++	ksmap_disable_smap();
++	rc = __commit_creds(new);
++	ksmap_enable_smap();
++
++	return rc;
++}
+ EXPORT_SYMBOL(commit_creds);
+ 
++int commit_creds_nosmap(struct cred *new)
++{
++	return __commit_creds(new);
++}
++EXPORT_SYMBOL(commit_creds_nosmap);
++
++
+ /**
+  * abort_creds - Discard a set of credentials and unlock the current task
+  * @new: The credentials that were going to be applied
+@@ -520,7 +637,7 @@ EXPORT_SYMBOL(commit_creds);
+  * Discard a set of credentials that were under construction and unlock the
+  * current task.
+  */
+-void abort_creds(struct cred *new)
++static inline void __abort_creds(struct cred *new)
+ {
+ 	kdebug("abort_creds(%p{%d,%d})", new,
+ 	       atomic_read(&new->usage),
+@@ -530,10 +647,23 @@ void abort_creds(struct cred *new)
+ 	BUG_ON(read_cred_subscribers(new) != 0);
+ #endif
+ 	BUG_ON(atomic_read(&new->usage) < 1);
+-	put_cred(new);
++	put_cred_nosmap(new);
++}
++
++void abort_creds(struct cred *new)
++{
++	ksmap_disable_smap();
++	__abort_creds(new);
++	ksmap_enable_smap();
+ }
+ EXPORT_SYMBOL(abort_creds);
+ 
++void abort_creds_nosmap(struct cred *new)
++{
++	__abort_creds(new);
++}
++EXPORT_SYMBOL(abort_creds_nosmap);
++
+ /**
+  * override_creds - Override the current process's subjective credentials
+  * @new: The credentials to be assigned
+@@ -541,7 +671,7 @@ EXPORT_SYMBOL(abort_creds);
+  * Install a set of temporary override subjective credentials on the current
+  * process, returning the old set for later reversion.
+  */
+-const struct cred *override_creds(const struct cred *new)
++static inline const struct cred *__override_creds(const struct cred *new)
+ {
+ 	const struct cred *old = current->cred;
+ 
+@@ -563,7 +693,7 @@ const struct cred *override_creds(const struct cred *new)
+ 	 * Also note that we did validate_creds() manually, not depending
+ 	 * on the validation in 'get_cred()'.
+ 	 */
+-	get_new_cred((struct cred *)new);
++	atomic_inc(&(((struct cred *)new)->usage));
+ 	alter_cred_subscribers(new, 1);
+ 	rcu_assign_pointer(current->cred, new);
+ 	alter_cred_subscribers(old, -1);
+@@ -573,6 +703,23 @@ const struct cred *override_creds(const struct cred *new)
+ 	       read_cred_subscribers(old));
+ 	return old;
+ }
++
++const struct cred *override_creds_nosmap(const struct cred *new)
++{
++	return __override_creds(new);
++}
++EXPORT_SYMBOL(override_creds_nosmap);
++
++const struct cred *override_creds(const struct cred *new)
++{
++	const struct cred* cred;
++
++	ksmap_disable_smap();
++	cred = __override_creds(new);
++	ksmap_enable_smap();
++
++	return cred;
++}
+ EXPORT_SYMBOL(override_creds);
+ 
+ /**
+@@ -582,7 +729,7 @@ EXPORT_SYMBOL(override_creds);
+  * Revert a temporary set of override subjective credentials to an old set,
+  * discarding the override set.
+  */
+-void revert_creds(const struct cred *old)
++static inline void __revert_creds(const struct cred *old)
+ {
+ 	const struct cred *override = current->cred;
+ 
+@@ -595,10 +742,23 @@ void revert_creds(const struct cred *old)
+ 	alter_cred_subscribers(old, 1);
+ 	rcu_assign_pointer(current->cred, old);
+ 	alter_cred_subscribers(override, -1);
+-	put_cred(override);
++	put_cred_nosmap(override);
++}
++
++void revert_creds(const struct cred *old)
++{
++	ksmap_disable_smap();
++	__revert_creds(old);
++	ksmap_enable_smap();
+ }
+ EXPORT_SYMBOL(revert_creds);
+ 
++void revert_creds_nosmap(const struct cred *old)
++{
++	__revert_creds(old);
++}
++EXPORT_SYMBOL(revert_creds_nosmap);
++
+ /**
+  * cred_fscmp - Compare two credentials with respect to filesystem access.
+  * @a: The first credential
+@@ -660,6 +820,9 @@ void __init cred_init(void)
+ {
+ 	/* allocate a slab in which we can store credentials */
+ 	cred_jar = kmem_cache_create("cred_jar", sizeof(struct cred), 0,
++			SLAB_HWCACHE_ALIGN|SLAB_PANIC|SLAB_ACCOUNT|SLAB_KSMAP, NULL);
++	
++	cred_rcu_jar = kmem_cache_create("cred_rcu_jar", sizeof(struct cred_rcu), 0,
+ 			SLAB_HWCACHE_ALIGN|SLAB_PANIC|SLAB_ACCOUNT, NULL);
+ }
+ 
+@@ -679,21 +842,23 @@ void __init cred_init(void)
+  *
+  * Returns the new credentials or NULL if out of memory.
+  */
+-struct cred *prepare_kernel_cred(struct task_struct *daemon)
++static inline struct cred *__prepare_kernel_cred(struct task_struct *daemon)
+ {
+ 	const struct cred *old;
+ 	struct cred *new;
+ 
+ 	new = kmem_cache_alloc(cred_jar, GFP_KERNEL);
+-	if (!new)
+-		return NULL;
++	if (!new) {
++		new = NULL;
++		goto out;
++	}
+ 
+ 	kdebug("prepare_kernel_cred() alloc %p", new);
+ 
+ 	if (daemon)
+-		old = get_task_cred(daemon);
++		old = get_task_cred_nosmap(daemon);
+ 	else
+-		old = get_cred(&init_cred);
++		old = get_cred_nosmap(&init_cred);
+ 
+ 	validate_creds(old);
+ 
+@@ -719,17 +884,36 @@ struct cred *prepare_kernel_cred(struct task_struct *daemon)
+ 	if (security_prepare_creds(new, old, GFP_KERNEL_ACCOUNT) < 0)
+ 		goto error;
+ 
+-	put_cred(old);
++	put_cred_nosmap(old);
+ 	validate_creds(new);
+-	return new;
++	goto out;
+ 
+ error:
+-	put_cred(new);
+-	put_cred(old);
+-	return NULL;
++	put_cred_nosmap(new);
++	put_cred_nosmap(old);
++out:
++	return new;
++}
++
++struct cred *prepare_kernel_cred(struct task_struct *daemon)
++{
++	struct cred *new;
++
++	ksmap_disable_smap();
++	new = __prepare_kernel_cred(daemon);
++	ksmap_enable_smap();
++
++	return new;
+ }
+ EXPORT_SYMBOL(prepare_kernel_cred);
+ 
++struct cred *prepare_kernel_cred_nosmap(struct task_struct *daemon)
++{
++	return __prepare_kernel_cred(daemon);
++}
++EXPORT_SYMBOL(prepare_kernel_cred_nosmap);
++
++
+ /**
+  * set_security_override - Set the security ID in a set of credentials
+  * @new: The credentials to alter
+diff --git a/kernel/exit.c b/kernel/exit.c
+index 04029e35e69a..d9280a6a01ee 100644
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -184,11 +184,18 @@ void release_task(struct task_struct *p)
+ 	struct task_struct *leader;
+ 	struct pid *thread_pid;
+ 	int zap_leader;
++	unsigned long eflags;
+ repeat:
+ 	/* don't need to get the RCU readlock here - the process is dead and
+ 	 * can't be modifying its own credentials. But shut RCU-lockdep up */
+ 	rcu_read_lock();
++	eflags = native_save_fl();
++
++	if (!(eflags & X86_EFLAGS_AC))
++		ksmap_disable_smap();
+ 	atomic_dec(&__task_cred(p)->user->processes);
++	if (!(eflags & X86_EFLAGS_AC))
++		ksmap_enable_smap();
+ 	rcu_read_unlock();
+ 
+ 	cgroup_release(p);
+@@ -961,7 +968,7 @@ static int eligible_pid(struct wait_opts *wo, struct task_struct *p)
+ 		task_pid_type(p, wo->wo_type) == wo->wo_pid;
+ }
+ 
+-static int
++int
+ eligible_child(struct wait_opts *wo, bool ptrace, struct task_struct *p)
+ {
+ 	if (!eligible_pid(wo, p))
+@@ -994,11 +1001,11 @@ eligible_child(struct wait_opts *wo, bool ptrace, struct task_struct *p)
+  * the lock and this task is uninteresting.  If we return nonzero, we have
+  * released the lock and the system call should return.
+  */
+-static int wait_task_zombie(struct wait_opts *wo, struct task_struct *p)
++int wait_task_zombie(struct wait_opts *wo, struct task_struct *p)
+ {
+ 	int state, status;
+ 	pid_t pid = task_pid_vnr(p);
+-	uid_t uid = from_kuid_munged(current_user_ns(), task_uid(p));
++	uid_t uid = from_kuid_munged(current_user_ns(), task_uid_nested(p));
+ 	struct waitid_info *infop;
+ 
+ 	if (!likely(wo->wo_flags & WEXITED))
+@@ -1153,7 +1160,7 @@ static int *task_stopped_code(struct task_struct *p, bool ptrace)
+  * success, implies that tasklist_lock is released and wait condition
+  * search should terminate.
+  */
+-static int wait_task_stopped(struct wait_opts *wo,
++int wait_task_stopped(struct wait_opts *wo,
+ 				int ptrace, struct task_struct *p)
+ {
+ 	struct waitid_info *infop;
+@@ -1184,7 +1191,7 @@ static int wait_task_stopped(struct wait_opts *wo,
+ 	if (!unlikely(wo->wo_flags & WNOWAIT))
+ 		*p_code = 0;
+ 
+-	uid = from_kuid_munged(current_user_ns(), task_uid(p));
++	uid = from_kuid_munged(current_user_ns(), task_uid_nested(p));
+ unlock_sig:
+ 	spin_unlock_irq(&p->sighand->siglock);
+ 	if (!exit_code)
+@@ -1225,7 +1232,7 @@ static int wait_task_stopped(struct wait_opts *wo,
+  * the lock and this task is uninteresting.  If we return nonzero, we have
+  * released the lock and the system call should return.
+  */
+-static int wait_task_continued(struct wait_opts *wo, struct task_struct *p)
++int wait_task_continued(struct wait_opts *wo, struct task_struct *p)
+ {
+ 	struct waitid_info *infop;
+ 	pid_t pid;
+@@ -1245,7 +1252,7 @@ static int wait_task_continued(struct wait_opts *wo, struct task_struct *p)
+ 	}
+ 	if (!unlikely(wo->wo_flags & WNOWAIT))
+ 		p->signal->flags &= ~SIGNAL_STOP_CONTINUED;
+-	uid = from_kuid_munged(current_user_ns(), task_uid(p));
++	uid = from_kuid_munged(current_user_ns(), task_uid_nested(p));
+ 	spin_unlock_irq(&p->sighand->siglock);
+ 
+ 	pid = task_pid_vnr(p);
+diff --git a/kernel/fork.c b/kernel/fork.c
+index d66cd1014211..8df6c7bd5757 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -108,6 +108,8 @@
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/task.h>
+ 
++#include <asm/ptrace.h>
++
+ /*
+  * Minimum number of threads to boot the kernel
+  */
+@@ -164,6 +166,7 @@ void __weak arch_release_task_struct(struct task_struct *tsk)
+ 
+ #ifndef CONFIG_ARCH_TASK_STRUCT_ALLOCATOR
+ static struct kmem_cache *task_struct_cachep;
++static __ro_after_init struct kmem_cache *ksmap_iret_stack_cachep;
+ 
+ static inline struct task_struct *alloc_task_struct_node(int node)
+ {
+@@ -462,6 +465,12 @@ void free_task(struct task_struct *tsk)
+ 	arch_release_task_struct(tsk);
+ 	if (tsk->flags & PF_KTHREAD)
+ 		free_kthread_struct(tsk);
++	
++	ksmap_disable_smap();
++	kmem_cache_free(ksmap_iret_stack_cachep, (uint64_t)tsk->ksmap_iret_stack & (~(KSMAP_STACK_SIZE - 1)));
++	//ksmap_free_isolated_pages(virt_to_page(tsk->ksmap_iret_stack), get_order(KSMAP_STACK_SIZE));
++	ksmap_enable_smap();
++	
+ 	free_task_struct(tsk);
+ }
+ EXPORT_SYMBOL(free_task);
+@@ -734,7 +743,7 @@ void __put_task_struct(struct task_struct *tsk)
+ 	cgroup_free(tsk);
+ 	task_numa_free(tsk, true);
+ 	security_task_free(tsk);
+-	exit_creds(tsk);
++	exit_creds_nested(tsk);
+ 	delayacct_tsk_free(tsk);
+ 	put_signal_struct(tsk->signal);
+ 
+@@ -807,6 +816,11 @@ void __init fork_init(void)
+ 			arch_task_struct_size, align,
+ 			SLAB_PANIC|SLAB_ACCOUNT,
+ 			useroffset, usersize, NULL);
++	ksmap_iret_stack_cachep = kmem_cache_create("ksmap_iret_stack",
++			KSMAP_STACK_SIZE, 0,
++			SLAB_PANIC|SLAB_KSMAP,
++			NULL);
++
+ #endif
+ 
+ 	/* do the arch specific task caches init */
+@@ -945,6 +959,14 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
+ #ifdef CONFIG_MEMCG
+ 	tsk->active_memcg = NULL;
+ #endif
++
++	ksmap_disable_smap();
++	//tsk->ksmap_iret_stack = page_address(ksmap_get_isolated_pages(get_order(KSMAP_STACK_SIZE)));
++	tsk->ksmap_iret_stack = kmem_cache_alloc(ksmap_iret_stack_cachep, GFP_KERNEL|GFP_ATOMIC|GFP_NOWAIT);
++	tsk->ksmap_iret_stack->tsk_bck_ref = tsk;
++	tsk->ksmap_iret_stack = (struct ksmap_iret_stack *)&tsk->ksmap_iret_stack->tsk_bck_ref;
++	ksmap_enable_smap();
++
+ 	return tsk;
+ 
+ free_stack:
+@@ -1962,15 +1984,19 @@ static __latent_entropy struct task_struct *copy_process(
+ 	DEBUG_LOCKS_WARN_ON(!p->softirqs_enabled);
+ #endif
+ 	retval = -EAGAIN;
++	ksmap_disable_smap();
+ 	if (atomic_read(&p->real_cred->user->processes) >=
+ 			task_rlimit(p, RLIMIT_NPROC)) {
+ 		if (p->real_cred->user != INIT_USER &&
+-		    !capable(CAP_SYS_RESOURCE) && !capable(CAP_SYS_ADMIN))
++		    !capable_nosmap(CAP_SYS_RESOURCE) && !capable_nosmap(CAP_SYS_ADMIN)) {
++			ksmap_enable_smap();
+ 			goto bad_fork_free;
++		}
+ 	}
+ 	current->flags &= ~PF_NPROC_EXCEEDED;
+ 
+ 	retval = copy_creds(p, clone_flags);
++	ksmap_enable_smap();
+ 	if (retval < 0)
+ 		goto bad_fork_free;
+ 
+diff --git a/kernel/groups.c b/kernel/groups.c
+index fe7e6385530e..30733184390d 100644
+--- a/kernel/groups.c
++++ b/kernel/groups.c
+@@ -122,9 +122,11 @@ int groups_search(const struct group_info *group_info, kgid_t grp)
+  */
+ void set_groups(struct cred *new, struct group_info *group_info)
+ {
++	ksmap_disable_smap();
+ 	put_group_info(new->group_info);
+ 	get_group_info(group_info);
+ 	new->group_info = group_info;
++	ksmap_enable_smap();
+ }
+ 
+ EXPORT_SYMBOL(set_groups);
+@@ -159,6 +161,7 @@ SYSCALL_DEFINE2(getgroups, int, gidsetsize, gid_t __user *, grouplist)
+ 		return -EINVAL;
+ 
+ 	/* no need to grab task_lock here; it cannot change */
++	ksmap_disable_smap();
+ 	i = cred->group_info->ngroups;
+ 	if (gidsetsize) {
+ 		if (i > gidsetsize) {
+@@ -171,6 +174,7 @@ SYSCALL_DEFINE2(getgroups, int, gidsetsize, gid_t __user *, grouplist)
+ 		}
+ 	}
+ out:
++	ksmap_enable_smap();
+ 	return i;
+ }
+ 
+@@ -221,8 +225,10 @@ int in_group_p(kgid_t grp)
+ 	const struct cred *cred = current_cred();
+ 	int retval = 1;
+ 
++	ksmap_disable_smap();
+ 	if (!gid_eq(grp, cred->fsgid))
+ 		retval = groups_search(cred->group_info, grp);
++	ksmap_enable_smap();
+ 	return retval;
+ }
+ 
+@@ -233,8 +239,10 @@ int in_egroup_p(kgid_t grp)
+ 	const struct cred *cred = current_cred();
+ 	int retval = 1;
+ 
++	ksmap_disable_smap();
+ 	if (!gid_eq(grp, cred->egid))
+ 		retval = groups_search(cred->group_info, grp);
++	ksmap_enable_smap();
+ 	return retval;
+ }
+ 
+diff --git a/kernel/ptrace.c b/kernel/ptrace.c
+index 61db50f7ca86..34cdff57caf3 100644
+--- a/kernel/ptrace.c
++++ b/kernel/ptrace.c
+@@ -267,8 +267,8 @@ static int ptrace_check_attach(struct task_struct *child, bool ignore_state)
+ static bool ptrace_has_cap(struct user_namespace *ns, unsigned int mode)
+ {
+ 	if (mode & PTRACE_MODE_NOAUDIT)
+-		return ns_capable_noaudit(ns, CAP_SYS_PTRACE);
+-	return ns_capable(ns, CAP_SYS_PTRACE);
++		return ns_capable_noaudit_nosmap(ns, CAP_SYS_PTRACE);
++	return ns_capable_nosmap(ns, CAP_SYS_PTRACE);
+ }
+ 
+ /* Returns 0 on success, -errno on denial. */
+@@ -297,6 +297,7 @@ static int __ptrace_may_access(struct task_struct *task, unsigned int mode)
+ 	if (same_thread_group(task, current))
+ 		return 0;
+ 	rcu_read_lock();
++	ksmap_disable_smap();
+ 	if (mode & PTRACE_MODE_FSCREDS) {
+ 		caller_uid = cred->fsuid;
+ 		caller_gid = cred->fsgid;
+@@ -322,6 +323,7 @@ static int __ptrace_may_access(struct task_struct *task, unsigned int mode)
+ 		goto ok;
+ 	if (ptrace_has_cap(tcred->user_ns, mode))
+ 		goto ok;
++	ksmap_enable_smap();
+ 	rcu_read_unlock();
+ 	return -EPERM;
+ ok:
+@@ -339,9 +341,12 @@ static int __ptrace_may_access(struct task_struct *task, unsigned int mode)
+ 	mm = task->mm;
+ 	if (mm &&
+ 	    ((get_dumpable(mm) != SUID_DUMP_USER) &&
+-	     !ptrace_has_cap(mm->user_ns, mode)))
+-	    return -EPERM;
++	     !ptrace_has_cap(mm->user_ns, mode))) {
++		ksmap_enable_smap();
++	 	return -EPERM;
++	}
+ 
++	ksmap_enable_smap();
+ 	return security_ptrace_access_check(task, mode);
+ }
+ 
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index ca2bb629595f..628fc50d0472 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -4266,6 +4266,47 @@ asmlinkage __visible void schedule_tail(struct task_struct *prev)
+ 	calculate_sigpending();
+ }
+ 
++static __always_inline void ksmap_switch_state(struct task_struct *prev, struct task_struct *next)
++{
++	if (!in_interrupt()) {
++		uint64_t flags, tos;
++		struct ksmap_iret_stack *kis;
++
++		flags = native_save_fl();
++
++		if (!(flags & X86_EFLAGS_AC))
++			ksmap_disable_smap();
++
++		// check integrity of prev->ksmap_iret_stack
++		tos = (uint64_t)prev->ksmap_iret_stack;
++		kis = tos & (~(KSMAP_STACK_SIZE - 1));
++		BUG_ON(kis->tsk_bck_ref != prev);
++
++		// save SMAP state of prev
++		tos -= 8;
++		*(uint64_t *)tos = flags;
++		prev->ksmap_iret_stack = tos;
++
++		// check integrity of next->ksmap_iret_stack
++		tos = (uint64_t)next->ksmap_iret_stack;
++		kis = tos & (~(KSMAP_STACK_SIZE - 1));
++
++		// restore SMAP state of next 
++		// but only if it is not getting scheduled now
++		// for the first time
++		if (tos != &kis->tsk_bck_ref) {
++			BUG_ON(kis->tsk_bck_ref != next);
++			flags = *(uint64_t *)tos;
++			tos += 8;
++			next->ksmap_iret_stack = tos;
++
++			if (!(flags & X86_EFLAGS_AC))
++				ksmap_enable_smap();
++		} else // if it is, then just start it with SMAP enabled
++			ksmap_enable_smap();
++	}
++}
++
+ /*
+  * context_switch - switch to the new MM and the new thread's register state.
+  */
+@@ -4320,6 +4361,8 @@ context_switch(struct rq *rq, struct task_struct *prev,
+ 
+ 	prepare_lock_switch(rq, next, rf);
+ 
++	ksmap_switch_state(prev, next);
++
+ 	/* Here we just switch the register state and the stack. */
+ 	switch_to(prev, next, prev);
+ 	barrier();
+@@ -6066,9 +6109,11 @@ static bool check_same_owner(struct task_struct *p)
+ 	bool match;
+ 
+ 	rcu_read_lock();
++	ksmap_disable_smap();
+ 	pcred = __task_cred(p);
+ 	match = (uid_eq(cred->euid, pcred->euid) ||
+ 		 uid_eq(cred->euid, pcred->uid));
++	ksmap_enable_smap();
+ 	rcu_read_unlock();
+ 	return match;
+ }
+diff --git a/kernel/signal.c b/kernel/signal.c
+index 5ad8566534e7..5f71b47f3e68 100644
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@ -425,7 +425,9 @@ __sigqueue_alloc(int sig, struct task_struct *t, gfp_t flags, int override_rlimi
+ 	 * changes from/to zero.
+ 	 */
+ 	rcu_read_lock();
++	ksmap_disable_smap();
+ 	user = __task_cred(t)->user;
++	ksmap_enable_smap();
+ 	sigpending = atomic_inc_return(&user->sigpending);
+ 	if (sigpending == 1)
+ 		get_uid(user);
+@@ -812,13 +814,22 @@ static inline bool si_fromuser(const struct kernel_siginfo *info)
+ static bool kill_ok_by_cred(struct task_struct *t)
+ {
+ 	const struct cred *cred = current_cred();
+-	const struct cred *tcred = __task_cred(t);
++	const struct cred *tcred;
++	bool ok;
+ 
+-	return uid_eq(cred->euid, tcred->suid) ||
++	ksmap_disable_smap();
++
++	tcred = __task_cred(t);
++
++	ok = uid_eq(cred->euid, tcred->suid) ||
+ 	       uid_eq(cred->euid, tcred->uid) ||
+ 	       uid_eq(cred->uid, tcred->suid) ||
+ 	       uid_eq(cred->uid, tcred->uid) ||
+-	       ns_capable(tcred->user_ns, CAP_KILL);
++	       ns_capable_nosmap(tcred->user_ns, CAP_KILL);
++
++	ksmap_enable_smap();
++
++	return ok;
+ }
+ 
+ /*
+diff --git a/kernel/sys.c b/kernel/sys.c
+index 8bb46e50f02d..1b366489348f 100644
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -156,13 +156,26 @@ EXPORT_SYMBOL(fs_overflowgid);
+  */
+ static bool set_one_prio_perm(struct task_struct *p)
+ {
+-	const struct cred *cred = current_cred(), *pcred = __task_cred(p);
++	const struct cred *cred, *pcred;
++
++	cred = current_cred();
++	
++	ksmap_disable_smap();
++
++	pcred = __task_cred(p);
+ 
+ 	if (uid_eq(pcred->uid,  cred->euid) ||
+-	    uid_eq(pcred->euid, cred->euid))
++	    uid_eq(pcred->euid, cred->euid)) {
++		ksmap_enable_smap();
+ 		return true;
+-	if (ns_capable(pcred->user_ns, CAP_SYS_NICE))
++	}
++
++	if (ns_capable_nosmap(pcred->user_ns, CAP_SYS_NICE)) {
++		ksmap_enable_smap();
+ 		return true;
++	}
++
++	ksmap_enable_smap();
+ 	return false;
+ }
+ 
+@@ -364,17 +377,21 @@ long __sys_setregid(gid_t rgid, gid_t egid)
+ 	if ((egid != (gid_t) -1) && !gid_valid(kegid))
+ 		return -EINVAL;
+ 
+-	new = prepare_creds();
+-	if (!new)
++	ksmap_disable_smap();
++	new = prepare_creds_nosmap();
++	if (!new) {
++		ksmap_enable_smap();
+ 		return -ENOMEM;
++	}
+ 	old = current_cred();
+ 
+ 	retval = -EPERM;
+ 	if (rgid != (gid_t) -1) {
+ 		if (gid_eq(old->gid, krgid) ||
+ 		    gid_eq(old->egid, krgid) ||
+-		    ns_capable_setid(old->user_ns, CAP_SETGID))
++		    ns_capable_setid_nosmap(old->user_ns, CAP_SETGID)) {
+ 			new->gid = krgid;
++		}
+ 		else
+ 			goto error;
+ 	}
+@@ -382,8 +399,9 @@ long __sys_setregid(gid_t rgid, gid_t egid)
+ 		if (gid_eq(old->gid, kegid) ||
+ 		    gid_eq(old->egid, kegid) ||
+ 		    gid_eq(old->sgid, kegid) ||
+-		    ns_capable_setid(old->user_ns, CAP_SETGID))
++		    ns_capable_setid_nosmap(old->user_ns, CAP_SETGID)) {
+ 			new->egid = kegid;
++		}
+ 		else
+ 			goto error;
+ 	}
+@@ -397,10 +415,14 @@ long __sys_setregid(gid_t rgid, gid_t egid)
+ 	if (retval < 0)
+ 		goto error;
+ 
+-	return commit_creds(new);
++	retval = commit_creds_nosmap(new);
++	
++	ksmap_enable_smap();
++	return retval;
+ 
+ error:
+-	abort_creds(new);
++	abort_creds_nosmap(new);
++	ksmap_enable_smap();
+ 	return retval;
+ }
+ 
+@@ -426,14 +448,18 @@ long __sys_setgid(gid_t gid)
+ 	if (!gid_valid(kgid))
+ 		return -EINVAL;
+ 
+-	new = prepare_creds();
+-	if (!new)
++	ksmap_disable_smap();
++	new = prepare_creds_nosmap();
++	if (!new) {
++		ksmap_enable_smap();
+ 		return -ENOMEM;
++	}
+ 	old = current_cred();
+ 
+ 	retval = -EPERM;
+-	if (ns_capable_setid(old->user_ns, CAP_SETGID))
++	if (ns_capable_setid_nosmap(old->user_ns, CAP_SETGID)) {
+ 		new->gid = new->egid = new->sgid = new->fsgid = kgid;
++	}
+ 	else if (gid_eq(kgid, old->gid) || gid_eq(kgid, old->sgid))
+ 		new->egid = new->fsgid = kgid;
+ 	else
+@@ -443,10 +469,13 @@ long __sys_setgid(gid_t gid)
+ 	if (retval < 0)
+ 		goto error;
+ 
+-	return commit_creds(new);
++	retval = commit_creds_nosmap(new);
++	ksmap_enable_smap();
++	return retval;
+ 
+ error:
+-	abort_creds(new);
++	abort_creds_nosmap(new);
++	ksmap_enable_smap();
+ 	return retval;
+ }
+ 
+@@ -515,9 +544,12 @@ long __sys_setreuid(uid_t ruid, uid_t euid)
+ 	if ((euid != (uid_t) -1) && !uid_valid(keuid))
+ 		return -EINVAL;
+ 
+-	new = prepare_creds();
+-	if (!new)
++	ksmap_disable_smap();
++	new = prepare_creds_nosmap();
++	if (!new) {
++		ksmap_enable_smap();
+ 		return -ENOMEM;
++	}
+ 	old = current_cred();
+ 
+ 	retval = -EPERM;
+@@ -525,7 +557,7 @@ long __sys_setreuid(uid_t ruid, uid_t euid)
+ 		new->uid = kruid;
+ 		if (!uid_eq(old->uid, kruid) &&
+ 		    !uid_eq(old->euid, kruid) &&
+-		    !ns_capable_setid(old->user_ns, CAP_SETUID))
++		    !ns_capable_setid_nosmap(old->user_ns, CAP_SETUID))
+ 			goto error;
+ 	}
+ 
+@@ -534,10 +566,10 @@ long __sys_setreuid(uid_t ruid, uid_t euid)
+ 		if (!uid_eq(old->uid, keuid) &&
+ 		    !uid_eq(old->euid, keuid) &&
+ 		    !uid_eq(old->suid, keuid) &&
+-		    !ns_capable_setid(old->user_ns, CAP_SETUID))
++		    !ns_capable_setid_nosmap(old->user_ns, CAP_SETUID))
+ 			goto error;
+ 	}
+-
++	
+ 	if (!uid_eq(new->uid, old->uid)) {
+ 		retval = set_user(new);
+ 		if (retval < 0)
+@@ -552,10 +584,13 @@ long __sys_setreuid(uid_t ruid, uid_t euid)
+ 	if (retval < 0)
+ 		goto error;
+ 
+-	return commit_creds(new);
++	retval = commit_creds_nosmap(new);
++	ksmap_enable_smap();
++	return retval;
+ 
+ error:
+-	abort_creds(new);
++	abort_creds_nosmap(new);
++	ksmap_enable_smap();
+ 	return retval;
+ }
+ 
+@@ -587,22 +622,24 @@ long __sys_setuid(uid_t uid)
+ 	if (!uid_valid(kuid))
+ 		return -EINVAL;
+ 
+-	new = prepare_creds();
+-	if (!new)
++	ksmap_disable_smap();
++	new = prepare_creds_nosmap();
++	if (!new) {
++		ksmap_enable_smap();
+ 		return -ENOMEM;
++	}
+ 	old = current_cred();
+ 
+ 	retval = -EPERM;
+-	if (ns_capable_setid(old->user_ns, CAP_SETUID)) {
++	if (ns_capable_setid_nosmap(old->user_ns, CAP_SETUID)) {
+ 		new->suid = new->uid = kuid;
+ 		if (!uid_eq(kuid, old->uid)) {
+ 			retval = set_user(new);
+ 			if (retval < 0)
+ 				goto error;
+ 		}
+-	} else if (!uid_eq(kuid, old->uid) && !uid_eq(kuid, new->suid)) {
++	} else if (!uid_eq(kuid, old->uid) && !uid_eq(kuid, new->suid))
+ 		goto error;
+-	}
+ 
+ 	new->fsuid = new->euid = kuid;
+ 
+@@ -610,10 +647,13 @@ long __sys_setuid(uid_t uid)
+ 	if (retval < 0)
+ 		goto error;
+ 
+-	return commit_creds(new);
++	retval = commit_creds_nosmap(new);
++	ksmap_enable_smap();
++	return retval;
+ 
+ error:
+-	abort_creds(new);
++	abort_creds_nosmap(new);
++	ksmap_enable_smap();
+ 	return retval;
+ }
+ 
+@@ -648,14 +688,17 @@ long __sys_setresuid(uid_t ruid, uid_t euid, uid_t suid)
+ 	if ((suid != (uid_t) -1) && !uid_valid(ksuid))
+ 		return -EINVAL;
+ 
+-	new = prepare_creds();
+-	if (!new)
++	ksmap_disable_smap();
++	new = prepare_creds_nosmap();
++	if (!new) {
++		ksmap_enable_smap();
+ 		return -ENOMEM;
++	}
+ 
+ 	old = current_cred();
+ 
+ 	retval = -EPERM;
+-	if (!ns_capable_setid(old->user_ns, CAP_SETUID)) {
++	if (!ns_capable_setid_nosmap(old->user_ns, CAP_SETUID)) {
+ 		if (ruid != (uid_t) -1        && !uid_eq(kruid, old->uid) &&
+ 		    !uid_eq(kruid, old->euid) && !uid_eq(kruid, old->suid))
+ 			goto error;
+@@ -685,10 +728,12 @@ long __sys_setresuid(uid_t ruid, uid_t euid, uid_t suid)
+ 	if (retval < 0)
+ 		goto error;
+ 
+-	return commit_creds(new);
+-
++	retval = commit_creds_nosmap(new);
++	ksmap_enable_smap();
++	return retval;
+ error:
+-	abort_creds(new);
++	abort_creds_nosmap(new);
++	ksmap_enable_smap();
+ 	return retval;
+ }
+ 
+@@ -703,9 +748,11 @@ SYSCALL_DEFINE3(getresuid, uid_t __user *, ruidp, uid_t __user *, euidp, uid_t _
+ 	int retval;
+ 	uid_t ruid, euid, suid;
+ 
++	ksmap_disable_smap();
+ 	ruid = from_kuid_munged(cred->user_ns, cred->uid);
+ 	euid = from_kuid_munged(cred->user_ns, cred->euid);
+ 	suid = from_kuid_munged(cred->user_ns, cred->suid);
++	ksmap_enable_smap();
+ 
+ 	retval = put_user(ruid, ruidp);
+ 	if (!retval) {
+@@ -738,13 +785,16 @@ long __sys_setresgid(gid_t rgid, gid_t egid, gid_t sgid)
+ 	if ((sgid != (gid_t) -1) && !gid_valid(ksgid))
+ 		return -EINVAL;
+ 
+-	new = prepare_creds();
+-	if (!new)
++	ksmap_disable_smap();
++	new = prepare_creds_nosmap();
++	if (!new) {
++		ksmap_enable_smap();
+ 		return -ENOMEM;
++	}
+ 	old = current_cred();
+ 
+ 	retval = -EPERM;
+-	if (!ns_capable_setid(old->user_ns, CAP_SETGID)) {
++	if (!ns_capable_setid_nosmap(old->user_ns, CAP_SETGID)) {
+ 		if (rgid != (gid_t) -1        && !gid_eq(krgid, old->gid) &&
+ 		    !gid_eq(krgid, old->egid) && !gid_eq(krgid, old->sgid))
+ 			goto error;
+@@ -754,7 +804,7 @@ long __sys_setresgid(gid_t rgid, gid_t egid, gid_t sgid)
+ 		if (sgid != (gid_t) -1        && !gid_eq(ksgid, old->gid) &&
+ 		    !gid_eq(ksgid, old->egid) && !gid_eq(ksgid, old->sgid))
+ 			goto error;
+-	}
++	} 
+ 
+ 	if (rgid != (gid_t) -1)
+ 		new->gid = krgid;
+@@ -768,10 +818,12 @@ long __sys_setresgid(gid_t rgid, gid_t egid, gid_t sgid)
+ 	if (retval < 0)
+ 		goto error;
+ 
+-	return commit_creds(new);
+-
++	retval = commit_creds_nosmap(new);
++	ksmap_enable_smap();
++	return retval;
+ error:
+-	abort_creds(new);
++	abort_creds_nosmap(new);
++	ksmap_enable_smap();
+ 	return retval;
+ }
+ 
+@@ -786,9 +838,11 @@ SYSCALL_DEFINE3(getresgid, gid_t __user *, rgidp, gid_t __user *, egidp, gid_t _
+ 	int retval;
+ 	gid_t rgid, egid, sgid;
+ 
++	ksmap_disable_smap();
+ 	rgid = from_kgid_munged(cred->user_ns, cred->gid);
+ 	egid = from_kgid_munged(cred->user_ns, cred->egid);
+ 	sgid = from_kgid_munged(cred->user_ns, cred->sgid);
++	ksmap_enable_smap();
+ 
+ 	retval = put_user(rgid, rgidp);
+ 	if (!retval) {
+diff --git a/kernel/umh.c b/kernel/umh.c
+index 3f646613a9d3..a2a94066fd6c 100644
+--- a/kernel/umh.c
++++ b/kernel/umh.c
+@@ -87,9 +87,12 @@ static int call_usermodehelper_exec_async(void *data)
+ 	set_user_nice(current, 0);
+ 
+ 	retval = -ENOMEM;
+-	new = prepare_kernel_cred(current);
+-	if (!new)
++	ksmap_disable_smap();
++	new = prepare_kernel_cred_nosmap(current);
++	if (!new) {
++		ksmap_enable_smap();
+ 		goto out;
++	}
+ 
+ 	spin_lock(&umh_sysctl_lock);
+ 	new->cap_bset = cap_intersect(usermodehelper_bset, new->cap_bset);
+@@ -100,13 +103,15 @@ static int call_usermodehelper_exec_async(void *data)
+ 	if (sub_info->init) {
+ 		retval = sub_info->init(sub_info, new);
+ 		if (retval) {
+-			abort_creds(new);
++			abort_creds_nosmap(new);
++			ksmap_enable_smap();
+ 			goto out;
+ 		}
+ 	}
+ 
+-	commit_creds(new);
+-
++	commit_creds_nosmap(new);
++	ksmap_enable_smap();
++	
+ 	retval = kernel_execve(sub_info->path,
+ 			       (const char *const *)sub_info->argv,
+ 			       (const char *const *)sub_info->envp);
+diff --git a/mm/Kconfig b/mm/Kconfig
+index 24c045b24b95..7e85ed914a4b 100644
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -872,4 +872,11 @@ config MAPPING_DIRTY_HELPERS
+ config KMAP_LOCAL
+ 	bool
+ 
++config KSMAP
++	bool "Enable kSMAP isolation"
++	default y
++	help
++	  Enable SMAP-assisted isolation primitives. 
++
++
+ endmenu
+diff --git a/mm/Makefile b/mm/Makefile
+index 135bbb65511a..6b0909badbd2 100644
+--- a/mm/Makefile
++++ b/mm/Makefile
+@@ -80,6 +80,7 @@ obj-$(CONFIG_KSM) += ksm.o
+ obj-$(CONFIG_PAGE_POISONING) += page_poison.o
+ obj-$(CONFIG_SLAB) += slab.o
+ obj-$(CONFIG_SLUB) += slub.o
++obj-$(CONFIG_SLUB) += exactfit.o
+ obj-$(CONFIG_KASAN)	+= kasan/
+ obj-$(CONFIG_FAILSLAB) += failslab.o
+ obj-$(CONFIG_MEMORY_HOTPLUG) += memory_hotplug.o
+@@ -119,3 +120,4 @@ obj-$(CONFIG_MEMFD_CREATE) += memfd.o
+ obj-$(CONFIG_MAPPING_DIRTY_HELPERS) += mapping_dirty_helpers.o
+ obj-$(CONFIG_PTDUMP_CORE) += ptdump.o
+ obj-$(CONFIG_PAGE_REPORTING) += page_reporting.o
++obj-$(CONFIG_KSMAP) += ksmap.o
+diff --git a/mm/exactfit.c b/mm/exactfit.c
+new file mode 100644
+index 000000000000..3f6828e90dd2
+--- /dev/null
++++ b/mm/exactfit.c
+@@ -0,0 +1,195 @@
++#include <linux/exactfit.h>
++#include <linux/ksmap.h>
++
++#define EXACTFIT_HEAP_PAGES 2
++#define EXACTFIT_HEAP_SIZE EXACTFIT_HEAP_PAGES * PAGE_SIZE
++
++struct exactfit_freechunk {
++	union {
++		struct list_head list_entry; // used for regular freechunks
++		uint64_t size; // used by topchunk only
++	};
++};
++
++struct exactfit_fastbin {
++	void* freelist;
++	unsigned long tid;
++};
++
++struct topchunk { // needed for cmpxchg_double
++	void *address;
++	uint64_t size;
++	spinlock_t spinlock;
++} topchunk;
++
++struct exactfit_fastbin *fastbins_cache;
++uint64_t nr_fastbins = 0;
++
++#ifdef CONFIG_SLUB_HARDENED_FREELIST_AS_MAP_64_ALIGNED
++#define EXACTFIT_CHUNK_ALIGNMENT 64
++#else
++#define EXACTFIT_CHUNK_ALIGNMENT 8
++#endif
++
++static inline unsigned int req2allocsize(unsigned int size)
++{
++	return ALIGN(size, EXACTFIT_CHUNK_ALIGNMENT);
++}
++
++static inline unsigned int get_fastbinidx(unsigned int size)
++{
++	VM_BUG_ON(size > (PAGE_SIZE * sizeof(void *) / sizeof(struct exactfit_fastbin)));
++	return (size / EXACTFIT_CHUNK_ALIGNMENT) - 1;
++}
++
++static inline struct exactfit_fastbin *get_fastbin(unsigned int size)
++{
++	return &fastbins_cache[get_fastbinidx(size)];
++}
++
++static inline void exactfit_new_topchunk(void)
++{
++	int order = get_order(EXACTFIT_HEAP_SIZE);
++#ifdef CONFIG_KSMAP
++	struct page *pages = ksmap_get_isolated_pages(order);
++#else
++	struct page *pages = alloc_pages(GFP_KERNEL | __GFP_ZERO, order);
++#endif
++
++	topchunk.address = page_address(pages);
++	topchunk.size = EXACTFIT_HEAP_SIZE;
++}
++
++static void exactfit_config_heap(void)
++{
++	size_t i;
++	exactfit_new_topchunk();
++	spin_lock_init(&topchunk.spinlock);
++
++	// alloc 1 page for storing fastbin struct info
++#ifdef CONFIG_KSMAP
++	fastbins_cache = page_address(ksmap_get_isolated_pages(0));
++#else
++	fastbins_cache = page_address(alloc_pages(GFP_KERNEL | __GFP_ZERO, 0));
++#endif
++
++	for(i = 0; i <= get_fastbinidx(PAGE_SIZE); i++)
++		fastbins_cache[i].tid = 0;
++}
++
++void __init exactfit_init(void)
++{
++	exactfit_config_heap();
++}
++EXPORT_SYMBOL(exactfit_init);
++
++void *exactfit_alloc(unsigned int size, gfp_t gfp_flags)
++{
++	struct exactfit_fastbin *fb;
++	unsigned long tid;
++	void *address;
++	void *freelist;
++	uint64_t old_topchunk_size;
++
++	size = req2allocsize(size);
++
++	fb = get_fastbin(size);
++
++redo:
++	tid = fb->tid;
++
++	/* We need to make sure that previous freelist will not be used with current tid */
++	barrier();
++	freelist = fb->freelist;
++
++	if (freelist) {
++		void *next;
++
++		copy_from_kernel_nofault(&next, freelist, sizeof(void*));
++
++		/* Atomically remove entry from freelist */
++		if(unlikely(!cmpxchg_double(&fb->freelist, &fb->tid,
++						freelist, tid,
++						next, tid+1)))
++			goto redo;
++
++		address = freelist;
++	} else {
++new_chunk:
++		old_topchunk_size = topchunk.size;
++
++		if (old_topchunk_size >= size) {
++			address = topchunk.address;
++
++			if (!cmpxchg_double(&topchunk.address, &topchunk.size,
++					    address, old_topchunk_size,
++					    address + size, old_topchunk_size - size))
++				goto new_chunk;
++		} else { // must enlarge topchunk
++			int order;
++			struct page *pages;
++			unsigned long flags;
++
++			/*
++			 * If ISLAB_VTX is enabled, the isolation primitive already takes care of
++			 * storing eflags and restoring them while interrupts are temporarily
++			 * disabled. That means we can then leave out these calls.
++			 */
++			if (gfpflags_allow_blocking(gfp_flags))
++				local_irq_save(flags);
++			spin_lock(&topchunk.spinlock);
++
++			/* After waiting to acquire the spin_lock the topchunk might've been
++			 * changed by another task. In that case, unlock the spinlock and
++			 * redo the allocation process */
++			if(size <= topchunk.size) {
++				spin_unlock(&topchunk.spinlock);
++				if (gfpflags_allow_blocking(gfp_flags))
++					local_irq_restore(flags);
++				goto redo;
++			}
++
++			order = get_order(EXACTFIT_HEAP_SIZE);
++#ifdef CONFIG_ISLAB_SMAP
++			pages = ksmap_get_isolated_pages(order);
++#else
++			pages = alloc_pages(GFP_KERNEL | __GFP_ZERO, order);
++#endif
++			address = page_address(pages);
++
++			topchunk.address = address + size;
++			topchunk.size = EXACTFIT_HEAP_SIZE - size;
++
++			spin_unlock(&topchunk.spinlock);
++			if (gfpflags_allow_blocking(gfp_flags))
++				local_irq_restore(flags);
++		}
++	}
++
++	return address;
++}
++EXPORT_SYMBOL(exactfit_alloc);
++
++void exactfit_free(void *address, unsigned int size)
++{
++	struct exactfit_fastbin *fb;
++	void *freelist;
++	unsigned long tid;
++
++	size = req2allocsize(size);
++	fb = get_fastbin(size);
++
++redo:
++	tid = fb->tid;
++
++	/* Same comment for alloc */
++	barrier();
++	freelist = fb->freelist;
++	*((void**)address) = freelist;
++
++	if(unlikely(!cmpxchg_double(&fb->freelist, &fb->tid,
++					freelist, tid,
++					address, tid + 1)))
++		goto redo;
++}
++EXPORT_SYMBOL(exactfit_free);
+diff --git a/mm/ksmap.c b/mm/ksmap.c
+new file mode 100644
+index 000000000000..7e9faabc4397
+--- /dev/null
++++ b/mm/ksmap.c
+@@ -0,0 +1,428 @@
++#include <linux/mm.h>
++#include <linux/hugetlb.h>
++#include <linux/irqflags.h>
++#include <linux/ksmap.h>
++#include <linux/page-flags.h>
++#include <linux/mm_types.h>
++
++#include <asm/pgtable.h>
++#include <asm/uaccess.h>
++
++#include <asm/set_memory.h>
++#include <asm/pgalloc.h>
++
++#include <linux/bit_spinlock.h>
++
++#ifdef CONFIG_KSMAP_DEBUG
++#define ksmap_printk(fmt, ...) printk("[kSMAP] %s" #fmt, __FUNCTION__, ##__VA_ARGS__)
++#else
++#define ksmap_printk(fmt, ...) (void)fmt
++#endif
++
++#define KSMAP_ORDER_2MB 9
++#define KSMAP_MAX_ORDER 9
++#define KSMAP_MIN_NR_2MB_PAGES 2
++#define KSMAP_ISOLATED 1
++#define KSMAP_UNISOLATED 0
++
++__ro_after_init uint64_t *ksmap_vas = NULL;
++
++struct list_head ksmap_freelists[KSMAP_MAX_ORDER + 1];
++unsigned int chunks = 0;
++
++spinlock_t ksmap_spinlock;
++
++static __always_inline void ksmap_populate_pte(pte_t *ptep, unsigned long address, int level)
++{
++	struct page *page = virt_to_page(address);
++	unsigned long offset, pfn = page_to_pfn(page), increment;
++
++	if (level == PG_LEVEL_1G)
++		increment = 512;
++	else
++		increment = 1;
++
++
++	for (offset = 0; offset < PTRS_PER_PTE; offset++, pfn += increment) {
++		set_pte(ptep++, pfn_pte(pfn, __pgprot(__PAGE_KERNEL)));
++	}
++}
++
++void ksmap_split_huge_page(struct page *page, pte_t *ptep, int level)
++{
++	pte_t *new_ptep;
++
++	if (level == PG_LEVEL_4K)
++		return;
++
++	if (!(new_ptep = pte_alloc_one_kernel(&init_mm)))
++		return;
++
++	if (level == PG_LEVEL_2M) {
++		pmd_t *pmdp;
++		unsigned long address;
++		
++		pmdp = (pmd_t *)ptep;
++		address = pmd_page_vaddr(*pmdp);
++	
++		ksmap_printk("Will split 2M address %llx", address);
++		
++		ksmap_populate_pte(new_ptep, address, level);
++
++		smp_wmb();
++
++		spin_lock(&init_mm.page_table_lock);
++
++		set_pmd(pmdp, __pmd(__pa(new_ptep) | _KERNPG_TABLE | _PAGE_NX));
++		flush_tlb_all();
++
++		spin_unlock(&init_mm.page_table_lock);
++	} else if (level == PG_LEVEL_1G) {
++		pr_err("Splitting 1GB pages not supported yet");
++		BUG_ON(true);
++	} 
++}
++
++static pte_t *ksmap_fetch_ptep(struct page *page, unsigned int *level)
++{
++	unsigned long addr;
++	pte_t *ptep;
++
++	addr = (unsigned long)page_address(page);
++	ptep = lookup_address(addr, level);
++	
++	ksmap_printk("Found PTE at level %u for page %px: %016lx\n", *level, page_address(page), ptep->pte);
++	
++	return ptep;
++}
++
++static void __ksmap_isolate_page(struct page *page, bool split)
++{
++	unsigned int level;
++	pte_t *ptep = ksmap_fetch_ptep(page, &level);
++
++	if (split)
++		ksmap_split_huge_page(page, ptep, level);
++	
++	set_pte(ptep, pte_set_flags(*ptep, _PAGE_USER));
++	
++	//flush_tlb_all();
++}
++
++static void __ksmap_deisolate_page(struct page *page)
++{
++	unsigned int level;
++	pte_t *ptep = ksmap_fetch_ptep(page, &level);
++
++	set_pte(ptep, pte_clear_flags(*ptep, _PAGE_USER));
++	
++	//flush_tlb_all();
++}
++
++static inline unsigned int ksmap_buddy_order(struct page *buddy)
++{
++	return page_private(buddy);
++}
++
++static inline bool page_is_ksmap_buddy(struct page *buddy, unsigned int order)
++{
++	if (!PageKsmap(buddy))
++		return false;
++
++	if (ksmap_buddy_order(buddy) != order)
++		return false;
++
++	return true;
++}
++
++static inline void ksmap_set_buddy_order(struct page *buddy, unsigned int order)
++{
++	set_page_private(buddy, order);
++}
++
++static void __ksmap_insert_to_freelist(struct page *buddy, unsigned int order)
++{
++	__SetPageKsmap(buddy);
++	ksmap_set_buddy_order(buddy, order);
++	list_add(&buddy->lru, &ksmap_freelists[order]);
++}
++
++static void __ksmap_remove_from_freelist(struct page *buddy)
++{
++	__ClearPageKsmap(buddy);
++	ksmap_set_buddy_order(buddy, -1);
++	list_del(&buddy->lru);
++}
++
++static void __ksmap_isolate_struct_page(struct page *page, uint64_t order)
++{
++	uint64_t obj_count = 1 << order;
++	uint64_t mem_page_count = (sizeof(struct page) * obj_count) / PAGE_SIZE;
++	struct page *page_page = virt_to_page(page);
++	int rc;
++	
++	ksmap_printk("sizeof(struct page) %lld, obj_count %lld, mem_page_count %lld, struct page %llx, struct page page %llx", sizeof(struct page), obj_count, mem_page_count, page, page_page);
++
++	if ((rc = split_huge_page(page_page))) {
++		pr_err("[kSMAP] %s Split huge pages failed with %d", __FUNCTION__, rc);
++		BUG_ON(true);
++	}
++
++	for (; mem_page_count; mem_page_count--) {
++		__ksmap_isolate_page(page_page, true);
++		ksmap_printk("Done isolating page of struct pages %llx", page_address(page_page));
++		page_page++;
++	}
++}
++
++static void __ksmap_increase_memory(void)
++{
++	struct page *new_mem;
++	uint64_t ksmap_vas_idx;
++	
++	ksmap_printk("Increasing memory by 2 MB\n");
++	
++	new_mem = alloc_pages(GFP_KERNEL | __GFP_ZERO, KSMAP_ORDER_2MB);
++	if (!new_mem) {
++		pr_err("Couldn't allocate pages");
++		BUG_ON(true);
++	}
++
++	__ksmap_insert_to_freelist(new_mem, KSMAP_ORDER_2MB);
++	chunks++;
++
++	ksmap_printk("New order 9 buddy at 0x%lx. kSMAP now holds %d pages.\n", (unsigned long)page_to_virt(new_mem), chunks);
++	
++	__ksmap_isolate_page(new_mem, false);
++	ksmap_printk("Isolated VA at 0x%lx\n", (unsigned long)page_to_virt(new_mem));
++
++	__ksmap_isolate_struct_page(new_mem, KSMAP_ORDER_2MB);
++
++	if (!ksmap_vas) {
++		ksmap_vas = page_address(ksmap_get_isolated_pages(0));
++		ksmap_vas[0] = 0; // ksmap_pfns_idx
++	}
++
++	ksmap_vas_idx = ++ksmap_vas[0];
++	ksmap_vas[ksmap_vas_idx] = page_address(new_mem);
++}
++
++void __init ksmap_init(void)
++{
++	int i;
++
++	ksmap_printk("Initializing\n");
++
++	spin_lock_init(&ksmap_spinlock);
++
++	for (i = 0; i <= KSMAP_MAX_ORDER; i++)
++		INIT_LIST_HEAD(&ksmap_freelists[i]);
++
++	__ksmap_increase_memory();
++}
++
++void ksmap_verify_va(uint64_t va)
++{
++	uint64_t ksmap_vas_idx = ksmap_vas[0], i;
++
++	for (i = 1; i <= ksmap_vas_idx; i++)
++	{
++		uint64_t current_va = ksmap_vas[i];
++		if (likely((va >= current_va) && 
++			(va < (current_va + 0x200000)))) // 2MB
++			return;
++	}
++
++	BUG_ON(true);
++}
++EXPORT_SYMBOL(ksmap_verify_va);
++
++static inline unsigned long
++__ksmap_find_buddy_pfn(unsigned long page_pfn, unsigned int order)
++{
++	return page_pfn ^ (1 << order);
++}
++
++static inline unsigned long
++__ksmap_find_primary_buddy(unsigned long page_pfn, unsigned int order)
++{
++	return page_pfn & ~(1 << order);
++}
++
++static struct page *__ksmap_get_pages_from_freelist(unsigned int order)
++{
++	struct page *page;
++	
++	ksmap_printk("Called with order %d\n", order);
++	
++	if (!list_empty(&ksmap_freelists[order]))
++	{
++		page = list_first_entry(&ksmap_freelists[order], struct page, lru);
++	
++		__ksmap_remove_from_freelist(page);	
++		
++		ksmap_printk("Found buddy in freelist at 0x%lx\n", (unsigned long)page_to_virt(page));
++		return page;
++	}
++	
++	ksmap_printk("Freelist empty\n");
++	
++	return NULL;
++}
++
++static struct page *__ksmap_split_higher_order(unsigned int order)
++{
++	unsigned int cur = order + 1;
++	struct page *fst_buddy = NULL, *snd_buddy = NULL;
++
++	ksmap_printk("Need order %d\n", order);
++
++	while (cur <= KSMAP_MAX_ORDER) {
++		fst_buddy = __ksmap_get_pages_from_freelist(cur);
++		if (fst_buddy) {
++			ksmap_printk("Found entry for order %d\n", cur);
++			goto split;
++		}
++
++		cur++;
++		ksmap_printk("[kSMAP] __ksmap_split_higher_order: no freelist entry for order %d\n", cur);
++	}
++
++	ksmap_printk("Out of memory, allocating additional 2 MB\n");
++	
++	__ksmap_increase_memory();
++	
++	fst_buddy = __ksmap_get_pages_from_freelist(KSMAP_ORDER_2MB);
++	
++	cur--; // cur == 9 after this line
++	
++	// since the loop treats every order as if it had a buddy but oder 9 does not, we have to perform
++	// this check once in case order == 9
++	if (cur == order) {
++		ksmap_printk("Buddy for order %d found: 0x%lx\n", cur, (unsigned long)page_to_virt(fst_buddy));
++		return fst_buddy;
++	}
++	
++split:
++	ksmap_printk("start splitting found buddy until required order is found\n");
++	ksmap_printk("first buddy at 0x%lx with order %d\n", (unsigned long)page_to_virt(fst_buddy), cur);
++	
++	while (cur >= 0) { // order must be >= 0, cur is always >= 1 at this point
++		
++		cur--;
++		
++		snd_buddy = pfn_to_page(__ksmap_find_buddy_pfn(page_to_pfn(fst_buddy), cur));
++		
++		ksmap_printk("split at 0x%lx with order %d\n", (unsigned long)page_to_virt(snd_buddy), cur);
++		
++		__ksmap_insert_to_freelist(snd_buddy, cur);
++
++		if (cur == order) {
++			ksmap_printk("buddy for order %d found: 0x%lx\n", cur, (unsigned long)page_to_virt(fst_buddy));
++			return fst_buddy;
++		}
++	}
++	
++	return NULL;
++}
++
++/*
++	Function that returns 2^order pages which are marked as user space pages and can
++	only be accessed if smap protection is temporarily turned off.
++	Returns struct page ptr if successful and -ENOMEM if something went wrong
++*/
++struct page *ksmap_get_isolated_pages(unsigned int order)
++{
++	struct page *page;
++	
++	ksmap_printk("called for order %d\n", order);
++		
++	spin_lock(&ksmap_spinlock);
++
++	page = __ksmap_get_pages_from_freelist(order);
++	if (!page) {
++		page = __ksmap_split_higher_order(order);
++		ksmap_printk("split pages\n");
++	} else {
++		ksmap_printk("page received from freelist\n");
++	}
++	
++	spin_unlock(&ksmap_spinlock);
++
++	return page;
++}
++EXPORT_SYMBOL(ksmap_get_isolated_pages);
++
++void __ksmap_remove_va(uint64_t va)
++{
++	uint64_t ksmap_vas_idx = ksmap_vas[0], i;
++
++	for (i = 1; i <= ksmap_vas_idx; i++)
++	{
++		uint64_t current_va = ksmap_vas[i];
++		if (current_va == va) {
++			ksmap_vas[i] = 0;
++			return;
++		}
++	}
++
++	BUG_ON(true);
++}
++
++void ksmap_free_isolated_pages(struct page *page, unsigned int order)
++{
++	struct page *buddy;
++	unsigned long address;
++
++	ksmap_printk("called for buddy at 0x%lx with order %d\n", (unsigned long)page_to_virt(page), order);
++	
++	spin_lock(&ksmap_spinlock);
++	
++	while (order < KSMAP_MAX_ORDER) { // order 9 does not have a buddy
++		
++		buddy = pfn_to_page(__ksmap_find_buddy_pfn(page_to_pfn(page), order));
++		if (!page_is_ksmap_buddy(buddy, order)) { // easiest scenario, buddy is in use, just insert page into freelist
++			ksmap_printk("buddy in use\n");
++			
++			__ksmap_insert_to_freelist(page, order);	
++			spin_unlock(&ksmap_spinlock);
++			
++			return;
++		}
++		
++		// buddy is free
++		__ksmap_remove_from_freelist(buddy);
++		
++		ksmap_printk("deleted unused buddy from its freelist\n");
++		
++		// now neither page nor buddy are in any freelist and can be merged
++		// get the primary buddy for next iteration
++		ksmap_printk("merged buddy at 0x%lx with buddy at 0x%lx for new order %d\n", (unsigned long)page_to_virt(page), (unsigned long)page_to_virt(buddy), order+1);
++		
++		page = pfn_to_page(__ksmap_find_primary_buddy(page_to_pfn(page), order));
++		
++		order++;
++	}
++
++	// we merged all buddies along the way and ended up at order 9
++	if (chunks > KSMAP_MIN_NR_2MB_PAGES) {
++		chunks--;
++		
++		spin_unlock(&ksmap_spinlock);
++		
++		__ksmap_deisolate_page(page);
++		
++		address = (unsigned long)page_address(page);
++		ksmap_printk("Releasing page with start address %lx\n", address);
++		
++		__ksmap_remove_va(page_address(page));
++	
++		__free_pages(page, KSMAP_ORDER_2MB);
++		
++		ksmap_printk("Released page back to buddy. kSMAP holds %d pages currently.\n", chunks);
++	} else {
++		__ksmap_insert_to_freelist(page, KSMAP_ORDER_2MB);
++		spin_unlock(&ksmap_spinlock);
++	}
++}
++EXPORT_SYMBOL(ksmap_free_isolated_pages);
+diff --git a/mm/percpu-internal.h b/mm/percpu-internal.h
+index 18b768ac7dca..5729de85222b 100644
+--- a/mm/percpu-internal.h
++++ b/mm/percpu-internal.h
+@@ -20,6 +20,7 @@ enum pcpu_chunk_type {
+ #ifdef CONFIG_MEMCG_KMEM
+ 	PCPU_CHUNK_MEMCG,
+ #endif
++	PCPU_CHUNK_KSMAP,
+ 	PCPU_NR_CHUNK_TYPES,
+ 	PCPU_FAIL_ALLOC = PCPU_NR_CHUNK_TYPES
+ };
+@@ -80,6 +81,7 @@ struct pcpu_chunk {
+ 	int			nr_pages;	/* # of pages served by this chunk */
+ 	int			nr_populated;	/* # of populated pages */
+ 	int                     nr_empty_pop_pages; /* # of empty populated pages */
++	bool 			is_ksmap;
+ 	unsigned long		populated[];	/* populated bitmap */
+ };
+ 
+@@ -144,6 +146,10 @@ static inline bool pcpu_is_memcg_chunk(enum pcpu_chunk_type chunk_type)
+ #else
+ static inline enum pcpu_chunk_type pcpu_chunk_type(struct pcpu_chunk *chunk)
+ {
++	if (chunk->is_ksmap) {
++		printk("returning chunk smap type");
++		return PCPU_CHUNK_KSMAP;
++	}
+ 	return PCPU_CHUNK_ROOT;
+ }
+ 
+@@ -155,8 +161,7 @@ static inline bool pcpu_is_memcg_chunk(enum pcpu_chunk_type chunk_type)
+ 
+ static inline struct list_head *pcpu_chunk_list(enum pcpu_chunk_type chunk_type)
+ {
+-	return &pcpu_chunk_lists[pcpu_nr_slots *
+-				 pcpu_is_memcg_chunk(chunk_type)];
++	return &pcpu_chunk_lists[pcpu_nr_slots * chunk_type];
+ }
+ 
+ #ifdef CONFIG_PERCPU_STATS
+diff --git a/mm/percpu-vm.c b/mm/percpu-vm.c
+index e46f7a6917f9..5d7fe3609d9c 100644
+--- a/mm/percpu-vm.c
++++ b/mm/percpu-vm.c
+@@ -60,8 +60,12 @@ static void pcpu_free_pages(struct pcpu_chunk *chunk,
+ 		for (i = page_start; i < page_end; i++) {
+ 			struct page *page = pages[pcpu_page_idx(cpu, i)];
+ 
+-			if (page)
+-				__free_page(page);
++			if (page) {
++				if (pcpu_chunk_type(chunk) == PCPU_CHUNK_KSMAP)
++					ksmap_free_isolated_pages(page, 0);
++				else
++					__free_page(page);
++			}
+ 		}
+ 	}
+ }
+@@ -90,8 +94,11 @@ static int pcpu_alloc_pages(struct pcpu_chunk *chunk,
+ 	for_each_possible_cpu(cpu) {
+ 		for (i = page_start; i < page_end; i++) {
+ 			struct page **pagep = &pages[pcpu_page_idx(cpu, i)];
+-
+-			*pagep = alloc_pages_node(cpu_to_node(cpu), gfp, 0);
++			
++			if (gfp & GFP_KSMAP)
++				*pagep = ksmap_get_isolated_pages(0);
++			else
++				*pagep = alloc_pages_node(cpu_to_node(cpu), gfp, 0);
+ 			if (!*pagep)
+ 				goto err;
+ 		}
+@@ -190,10 +197,10 @@ static void pcpu_post_unmap_tlb_flush(struct pcpu_chunk *chunk,
+ }
+ 
+ static int __pcpu_map_pages(unsigned long addr, struct page **pages,
+-			    int nr_pages)
++			    int nr_pages, pgprot_t prot)
+ {
+ 	return map_kernel_range_noflush(addr, nr_pages << PAGE_SHIFT,
+-					PAGE_KERNEL, pages);
++					prot, pages);
+ }
+ 
+ /**
+@@ -215,11 +222,12 @@ static int pcpu_map_pages(struct pcpu_chunk *chunk,
+ {
+ 	unsigned int cpu, tcpu;
+ 	int i, err;
++	pgprot_t prot = chunk->is_ksmap ? PAGE_KERNEL_KSMAP : PAGE_KERNEL;
+ 
+ 	for_each_possible_cpu(cpu) {
+ 		err = __pcpu_map_pages(pcpu_chunk_addr(chunk, cpu, page_start),
+ 				       &pages[pcpu_page_idx(cpu, page_start)],
+-				       page_end - page_start);
++				       page_end - page_start, prot);
+ 		if (err < 0)
+ 			goto err;
+ 
+@@ -286,6 +294,7 @@ static int pcpu_populate_chunk(struct pcpu_chunk *chunk,
+ 
+ 	if (pcpu_map_pages(chunk, pages, page_start, page_end)) {
+ 		pcpu_free_pages(chunk, pages, page_start, page_end);
++
+ 		return -ENOMEM;
+ 	}
+ 	pcpu_post_map_flush(chunk, page_start, page_end);
+diff --git a/mm/percpu.c b/mm/percpu.c
+index 6596a0a4286e..354acf2a02ec 100644
+--- a/mm/percpu.c
++++ b/mm/percpu.c
+@@ -508,7 +508,7 @@ static void __pcpu_chunk_move(struct pcpu_chunk *chunk, int slot,
+ {
+ 	if (chunk != pcpu_reserved_chunk) {
+ 		struct list_head *pcpu_slot;
+-
++		
+ 		pcpu_slot = pcpu_chunk_list(pcpu_chunk_type(chunk));
+ 		if (move_front)
+ 			list_move(&chunk->list, &pcpu_slot[slot]);
+@@ -1403,6 +1403,9 @@ static struct pcpu_chunk *pcpu_alloc_chunk(enum pcpu_chunk_type type, gfp_t gfp)
+ 	if (!chunk)
+ 		return NULL;
+ 
++	if (gfp & GFP_KSMAP)
++		chunk->is_ksmap = true;
++
+ 	INIT_LIST_HEAD(&chunk->list);
+ 	chunk->nr_pages = pcpu_unit_pages;
+ 	region_bits = pcpu_chunk_map_bits(chunk);
+@@ -1693,7 +1696,7 @@ static void __percpu *pcpu_alloc(size_t size, size_t align, bool reserved,
+ 
+ 	gfp = current_gfp_context(gfp);
+ 	/* whitelisted flags that can be passed to the backing allocators */
+-	pcpu_gfp = gfp & (GFP_KERNEL | __GFP_NORETRY | __GFP_NOWARN);
++	pcpu_gfp = gfp & (GFP_KERNEL | __GFP_NORETRY | __GFP_NOWARN | GFP_KSMAP);
+ 	is_atomic = (gfp & GFP_KERNEL) != GFP_KERNEL;
+ 	do_warn = !(gfp & __GFP_NOWARN);
+ 
+@@ -1717,7 +1720,10 @@ static void __percpu *pcpu_alloc(size_t size, size_t align, bool reserved,
+ 		return NULL;
+ 	}
+ 
+-	type = pcpu_memcg_pre_alloc_hook(size, gfp, &objcg);
++	if (gfp & GFP_KSMAP)
++		type = PCPU_CHUNK_KSMAP;
++	else
++		type = pcpu_memcg_pre_alloc_hook(size, gfp, &objcg);
+ 	if (unlikely(type == PCPU_FAIL_ALLOC))
+ 		return NULL;
+ 	pcpu_slot = pcpu_chunk_list(type);
+@@ -1908,6 +1914,13 @@ void __percpu *__alloc_percpu(size_t size, size_t align)
+ }
+ EXPORT_SYMBOL_GPL(__alloc_percpu);
+ 
++void __percpu *__alloc_percpu_ksmap(size_t size, size_t align)
++{
++	return pcpu_alloc(size, align, false, GFP_KERNEL | GFP_KSMAP);
++}
++EXPORT_SYMBOL_GPL(__alloc_percpu_ksmap);
++
++
+ /**
+  * __alloc_reserved_percpu - allocate reserved percpu area
+  * @size: size of area to allocate in bytes
+@@ -2568,7 +2581,7 @@ void __init pcpu_setup_first_chunk(const struct pcpu_alloc_info *ai,
+ 	map_size = ai->reserved_size ?: dyn_size;
+ 	chunk = pcpu_alloc_first_chunk(tmp_addr, map_size);
+ 
+-	/* init dynamic chunk if necessary */
++	/* init reserved chunk if necessary */
+ 	if (ai->reserved_size) {
+ 		pcpu_reserved_chunk = chunk;
+ 
+@@ -3037,7 +3050,7 @@ int __init pcpu_page_first_chunk(size_t reserved_size,
+ 
+ 		/* pte already populated, the following shouldn't fail */
+ 		rc = __pcpu_map_pages(unit_addr, &pages[unit * unit_pages],
+-				      unit_pages);
++				      unit_pages, PAGE_KERNEL);
+ 		if (rc < 0)
+ 			panic("failed to map percpu area, err=%d\n", rc);
+ 
+diff --git a/mm/slab.h b/mm/slab.h
+index 48dc466a3791..b35d01197510 100644
+--- a/mm/slab.h
++++ b/mm/slab.h
+@@ -151,7 +151,7 @@ static inline slab_flags_t kmem_cache_flags(unsigned int object_size,
+ #endif
+ 
+ /* Common flags available with current configuration */
+-#define CACHE_CREATE_MASK (SLAB_CORE_FLAGS | SLAB_DEBUG_FLAGS | SLAB_CACHE_FLAGS)
++#define CACHE_CREATE_MASK (SLAB_CORE_FLAGS | SLAB_DEBUG_FLAGS | SLAB_CACHE_FLAGS | SLAB_KSMAP)
+ 
+ /* Common flags permitted for kmem_cache_create */
+ #define SLAB_FLAGS_PERMITTED (SLAB_CORE_FLAGS | \
+@@ -164,7 +164,8 @@ static inline slab_flags_t kmem_cache_flags(unsigned int object_size,
+ 			      SLAB_NOLEAKTRACE | \
+ 			      SLAB_RECLAIM_ACCOUNT | \
+ 			      SLAB_TEMPORARY | \
+-			      SLAB_ACCOUNT)
++			      SLAB_ACCOUNT | \
++			      SLAB_KSMAP)
+ 
+ bool __kmem_cache_empty(struct kmem_cache *);
+ int __kmem_cache_shutdown(struct kmem_cache *);
+@@ -413,8 +414,8 @@ static inline struct kmem_cache *virt_to_cache(const void *obj)
+ 	struct page *page;
+ 
+ 	page = virt_to_head_page(obj);
+-	if (WARN_ONCE(!PageSlab(page), "%s: Object is not a Slab page!\n",
+-					__func__))
++	if (WARN_ONCE(!PageSlab(page), "%s: Object is not a Slab page %llx!\n",
++					__func__, (uint64_t)obj))
+ 		return NULL;
+ 	return page->slab_cache;
+ }
+diff --git a/mm/slab_common.c b/mm/slab_common.c
+index 9633fa1bbbfd..f262cc29ac77 100644
+--- a/mm/slab_common.c
++++ b/mm/slab_common.c
+@@ -31,6 +31,8 @@
+ 
+ #include "slab.h"
+ 
++#include <linux/exactfit.h>
++
+ enum slab_state slab_state;
+ LIST_HEAD(slab_caches);
+ DEFINE_MUTEX(slab_mutex);
+@@ -168,6 +170,9 @@ int slab_unmergeable(struct kmem_cache *s)
+ 	if (slab_nomerge || (s->flags & SLAB_NEVER_MERGE))
+ 		return 1;
+ 
++	if (s->flags & SLAB_KSMAP)
++       		return 1;
++
+ 	if (s->ctor)
+ 		return 1;
+ 
+@@ -194,6 +199,9 @@ struct kmem_cache *find_mergeable(unsigned int size, unsigned int align,
+ 	if (ctor)
+ 		return NULL;
+ 
++	if (flags & SLAB_KSMAP)
++        	return NULL;
++
+ 	size = ALIGN(size, sizeof(void *));
+ 	align = calculate_alignment(flags, align, size);
+ 	size = ALIGN(size, align);
+@@ -243,7 +251,11 @@ static struct kmem_cache *create_cache(const char *name,
+ 		useroffset = usersize = 0;
+ 
+ 	err = -ENOMEM;
+-	s = kmem_cache_zalloc(kmem_cache, GFP_KERNEL);
++	if (flags & SLAB_KSMAP)
++		s = exactfit_alloc(offsetof(struct kmem_cache, node) + nr_node_ids * sizeof(struct kmem_cache_node *), 
++				GFP_KERNEL | __GFP_ZERO | SLAB_HWCACHE_ALIGN);
++	else
++		s = kmem_cache_zalloc(kmem_cache, GFP_KERNEL);
+ 	if (!s)
+ 		goto out;
+ 
+@@ -259,7 +271,8 @@ static struct kmem_cache *create_cache(const char *name,
+ 		goto out_free_cache;
+ 
+ 	s->refcount = 1;
+-	list_add(&s->list, &slab_caches);
++	if (!(flags & SLAB_KSMAP))
++		list_add(&s->list, &slab_caches); // FIXME: not adding ksmap-protected caches in global list for now
+ out:
+ 	if (err)
+ 		return ERR_PTR(err);
+diff --git a/mm/slub.c b/mm/slub.c
+index 175cd905b58a..bbf0e820c84b 100644
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -39,6 +39,8 @@
+ 
+ #include "internal.h"
+ 
++#include <linux/ksmap.h>
++#include <linux/exactfit.h>
+ /*
+  * Lock order:
+  *   1. slab_mutex (Global Mutex)
+@@ -266,7 +268,10 @@ static inline void *freelist_ptr(const struct kmem_cache *s, void *ptr,
+ 	 * calls get_freepointer() with an untagged pointer, which causes the
+ 	 * freepointer to be restored incorrectly.
+ 	 */
+-	return (void *)((unsigned long)ptr ^ s->random ^
++	if (s->flags & SLAB_KSMAP)
++		return ptr;
++	else
++		return (void *)((unsigned long)ptr ^ s->random ^
+ 			swab((unsigned long)kasan_reset_tag((void *)ptr_addr)));
+ #else
+ 	return ptr;
+@@ -1628,10 +1633,15 @@ static inline struct page *alloc_slab_page(struct kmem_cache *s,
+ 	struct page *page;
+ 	unsigned int order = oo_order(oo);
+ 
+-	if (node == NUMA_NO_NODE)
+-		page = alloc_pages(flags, order);
+-	else
+-		page = __alloc_pages_node(node, flags, order);
++	if (s->flags & SLAB_KSMAP) {
++		page = ksmap_get_isolated_pages(order);
++	}
++	else {
++	      if (node == NUMA_NO_NODE)
++	      	page = alloc_pages(flags, order);
++	      else
++	      	page = __alloc_pages_node(node, flags, order);
++	}
+ 
+ 	return page;
+ }
+@@ -1857,7 +1867,11 @@ static void __free_slab(struct kmem_cache *s, struct page *page)
+ 	if (current->reclaim_state)
+ 		current->reclaim_state->reclaimed_slab += pages;
+ 	unaccount_slab_page(page, order, s);
+-	__free_pages(page, order);
++	
++	if (s->flags & SLAB_KSMAP)
++        	ksmap_free_isolated_pages(page, order);
++	else
++        	__free_pages(page, order);
+ }
+ 
+ static void rcu_free_slab(struct rcu_head *h)
+@@ -2864,13 +2878,14 @@ static __always_inline void *slab_alloc_node(struct kmem_cache *s,
+ 	 * occurs on the right processor and that there was no operation on the
+ 	 * linked list in between.
+ 	 */
+-
+ 	object = c->freelist;
+ 	page = c->page;
+ 	if (unlikely(!object || !page || !node_match(page, node))) {
+ 		object = __slab_alloc(s, gfpflags, node, addr, c);
+ 	} else {
+-		void *next_object = get_freepointer_safe(s, object);
++		void *next_object;
++
++		next_object = get_freepointer_safe(s, object);
+ 
+ 		/*
+ 		 * The cmpxchg will only match if there was no additional
+@@ -2904,7 +2919,7 @@ static __always_inline void *slab_alloc_node(struct kmem_cache *s,
+ 		memset(kasan_reset_tag(object), 0, s->object_size);
+ 
+ 	slab_post_alloc_hook(s, objcg, gfpflags, 1, &object);
+-
++	
+ 	return object;
+ }
+ 
+@@ -3154,6 +3169,7 @@ static __always_inline void slab_free(struct kmem_cache *s, struct page *page,
+ 	 * With KASAN enabled slab_free_freelist_hook modifies the freelist
+ 	 * to remove objects, whose reuse must be delayed.
+ 	 */
++	
+ 	if (slab_free_freelist_hook(s, &head, &tail))
+ 		do_slab_free(s, page, head, tail, cnt, addr);
+ }
+@@ -3349,11 +3365,13 @@ int kmem_cache_alloc_bulk(struct kmem_cache *s, gfp_t flags, size_t size,
+ 
+ 	/* memcg and kmem_cache debug support */
+ 	slab_post_alloc_hook(s, objcg, flags, size, p);
++	
+ 	return i;
+ error:
+ 	local_irq_enable();
+ 	slab_post_alloc_hook(s, objcg, flags, i, p);
+ 	__kmem_cache_free_bulk(s, i, p);
++	
+ 	return 0;
+ }
+ EXPORT_SYMBOL(kmem_cache_alloc_bulk);
+@@ -3519,7 +3537,11 @@ static inline int alloc_kmem_cache_cpus(struct kmem_cache *s)
+ 	 * Must align to double word boundary for the double cmpxchg
+ 	 * instructions to work; see __pcpu_double_call_return_bool().
+ 	 */
+-	s->cpu_slab = __alloc_percpu(sizeof(struct kmem_cache_cpu),
++	if (s->flags & SLAB_KSMAP)
++		s->cpu_slab = __alloc_percpu_ksmap(sizeof(struct kmem_cache_cpu),
++				     2 * sizeof(void *));
++	else
++		s->cpu_slab = __alloc_percpu(sizeof(struct kmem_cache_cpu),
+ 				     2 * sizeof(void *));
+ 
+ 	if (!s->cpu_slab)
+@@ -3607,7 +3629,11 @@ static int init_kmem_cache_nodes(struct kmem_cache *s)
+ 			early_kmem_cache_node_alloc(node);
+ 			continue;
+ 		}
+-		n = kmem_cache_alloc_node(kmem_cache_node,
++		
++		if (s->flags & SLAB_KSMAP)
++			n = exactfit_alloc(sizeof(struct kmem_cache_node), GFP_KERNEL | SLAB_HWCACHE_ALIGN);
++		else
++			n = kmem_cache_alloc_node(kmem_cache_node,
+ 						GFP_KERNEL, node);
+ 
+ 		if (!n) {
+@@ -4434,6 +4460,8 @@ void __init kmem_cache_init(void)
+ 	if (debug_guardpage_minorder())
+ 		slub_max_order = 0;
+ 
++	exactfit_init();
++
+ 	kmem_cache_node = &boot_kmem_cache_node;
+ 	kmem_cache = &boot_kmem_cache;
+ 
+@@ -4518,9 +4546,11 @@ int __kmem_cache_create(struct kmem_cache *s, slab_flags_t flags)
+ 	if (slab_state <= UP)
+ 		return 0;
+ 
+-	err = sysfs_slab_add(s);
+-	if (err)
+-		__kmem_cache_release(s);
++	if (!(flags & SLAB_KSMAP)) { // FIXME: not adding ksmap-protected caches in sysfs for now
++		err = sysfs_slab_add(s);
++		if (err)
++			__kmem_cache_release(s);
++	}
+ 
+ 	return err;
+ }
+diff --git a/net/core/scm.c b/net/core/scm.c
+index 8156d4fb8a39..0d6f08288330 100644
+--- a/net/core/scm.c
++++ b/net/core/scm.c
+@@ -44,22 +44,35 @@
+ 
+ static __inline__ int scm_check_creds(struct ucred *creds)
+ {
++	int rc;
++	kuid_t uid; 
++	kgid_t gid;
+ 	const struct cred *cred = current_cred();
+-	kuid_t uid = make_kuid(cred->user_ns, creds->uid);
+-	kgid_t gid = make_kgid(cred->user_ns, creds->gid);
+ 
+-	if (!uid_valid(uid) || !gid_valid(gid))
+-		return -EINVAL;
++	ksmap_disable_smap();
++	
++	uid = make_kuid(cred->user_ns, creds->uid);
++	gid = make_kgid(cred->user_ns, creds->gid);
++
++	if (!uid_valid(uid) || !gid_valid(gid)) {
++		rc = -EINVAL;
++		goto out;
++	}
+ 
+ 	if ((creds->pid == task_tgid_vnr(current) ||
+-	     ns_capable(task_active_pid_ns(current)->user_ns, CAP_SYS_ADMIN)) &&
+-	    ((uid_eq(uid, cred->uid)   || uid_eq(uid, cred->euid) ||
+-	      uid_eq(uid, cred->suid)) || ns_capable(cred->user_ns, CAP_SETUID)) &&
+-	    ((gid_eq(gid, cred->gid)   || gid_eq(gid, cred->egid) ||
+-	      gid_eq(gid, cred->sgid)) || ns_capable(cred->user_ns, CAP_SETGID))) {
+-	       return 0;
++	     ns_capable_nosmap(task_active_pid_ns(current)->user_ns, CAP_SYS_ADMIN))) {
++		if (((uid_eq(uid, cred->uid) || uid_eq(uid, cred->euid) ||
++	      	uid_eq(uid, cred->suid)) || ns_capable_nosmap(cred->user_ns, CAP_SETUID)) &&
++	    	((gid_eq(gid, cred->gid)   || gid_eq(gid, cred->egid) ||
++	      	gid_eq(gid, cred->sgid)) || ns_capable_nosmap(cred->user_ns, CAP_SETGID))) {
++	       		rc = 0;
++	       		goto out;
++		}
+ 	}
+-	return -EPERM;
++	rc = -EPERM;
++out:
++	ksmap_enable_smap();
++	return rc;
+ }
+ 
+ static int scm_fp_copy(struct cmsghdr *cmsg, struct scm_fp_list **fplp)
+diff --git a/net/core/sock.c b/net/core/sock.c
+index 0ed98f20448a..72669de10837 100644
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@ -1279,9 +1279,11 @@ static void cred_to_ucred(struct pid *pid, const struct cred *cred,
+ 	ucred->uid = ucred->gid = -1;
+ 	if (cred) {
+ 		struct user_namespace *current_ns = current_user_ns();
+-
++	
++		ksmap_disable_smap();
+ 		ucred->uid = from_kuid_munged(current_ns, cred->euid);
+ 		ucred->gid = from_kgid_munged(current_ns, cred->egid);
++		ksmap_enable_smap();
+ 	}
+ }
+ 
+@@ -1457,15 +1459,18 @@ int sock_getsockopt(struct socket *sock, int level, int optname,
+ 		if (!sk->sk_peer_cred)
+ 			return -ENODATA;
+ 
++		ksmap_disable_smap();
+ 		n = sk->sk_peer_cred->group_info->ngroups;
+ 		if (len < n * sizeof(gid_t)) {
+ 			len = n * sizeof(gid_t);
++			ksmap_enable_smap();
+ 			return put_user(len, optlen) ? -EFAULT : -ERANGE;
+ 		}
+ 		len = n * sizeof(gid_t);
+ 
+ 		ret = groups_to_user((gid_t __user *)optval,
+ 				     sk->sk_peer_cred->group_info);
++		ksmap_enable_smap();
+ 		if (ret)
+ 			return ret;
+ 		goto lenout;
+diff --git a/net/dns_resolver/dns_key.c b/net/dns_resolver/dns_key.c
+index 3aced951d5ab..49dd8cd8a305 100644
+--- a/net/dns_resolver/dns_key.c
++++ b/net/dns_resolver/dns_key.c
+@@ -337,9 +337,12 @@ static int __init init_dns_resolver(void)
+ 	 * this is used to prevent malicious redirections from being installed
+ 	 * with add_key().
+ 	 */
+-	cred = prepare_kernel_cred(NULL);
+-	if (!cred)
++	ksmap_disable_smap();
++	cred = prepare_kernel_cred_nosmap(NULL);
++	if (!cred) {
++		ksmap_enable_smap();
+ 		return -ENOMEM;
++	}
+ 
+ 	keyring = keyring_alloc(".dns_resolver",
+ 				GLOBAL_ROOT_UID, GLOBAL_ROOT_GID, cred,
+@@ -360,6 +363,7 @@ static int __init init_dns_resolver(void)
+ 	set_bit(KEY_FLAG_ROOT_CAN_CLEAR, &keyring->flags);
+ 	cred->thread_keyring = keyring;
+ 	cred->jit_keyring = KEY_REQKEY_DEFL_THREAD_KEYRING;
++	ksmap_enable_smap();
+ 	dns_resolver_cache = cred;
+ 
+ 	kdebug("DNS resolver keyring: %d\n", key_serial(keyring));
+@@ -368,7 +372,8 @@ static int __init init_dns_resolver(void)
+ failed_put_key:
+ 	key_put(keyring);
+ failed_put_cred:
+-	put_cred(cred);
++	put_cred_nosmap(cred);
++	ksmap_enable_smap();
+ 	return ret;
+ }
+ 
+diff --git a/net/wireless/reg.c b/net/wireless/reg.c
+index 21536c48deec..fd550d418d38 100644
+--- a/net/wireless/reg.c
++++ b/net/wireless/reg.c
+@@ -777,12 +777,14 @@ static void __init load_keys_from_buffer(const u8 *p, unsigned int buflen)
+ 
+ static int __init load_builtin_regdb_keys(void)
+ {
++	ksmap_disable_smap();
+ 	builtin_regdb_keys =
+ 		keyring_alloc(".builtin_regdb_keys",
+ 			      KUIDT_INIT(0), KGIDT_INIT(0), current_cred(),
+ 			      ((KEY_POS_ALL & ~KEY_POS_SETATTR) |
+ 			      KEY_USR_VIEW | KEY_USR_READ | KEY_USR_SEARCH),
+ 			      KEY_ALLOC_NOT_IN_QUOTA, NULL, NULL);
++	ksmap_enable_smap();
+ 	if (IS_ERR(builtin_regdb_keys))
+ 		return PTR_ERR(builtin_regdb_keys);
+ 
+diff --git a/security/commoncap.c b/security/commoncap.c
+index 28f4d25480df..9ccb9d08f05e 100644
+--- a/security/commoncap.c
++++ b/security/commoncap.c
+@@ -62,33 +62,41 @@ static void warn_setuid_and_fcaps_mixed(const char *fname)
+  * cap_has_capability() returns 0 when a task has a capability, but the
+  * kernel's capable() and has_capability() returns 1 for this case.
+  */
+-int cap_capable(const struct cred *cred, struct user_namespace *targ_ns,
++static inline int __cap_capable(const struct cred *cred, struct user_namespace *targ_ns,
+ 		int cap, unsigned int opts)
+ {
+ 	struct user_namespace *ns = targ_ns;
++	int rc;
+ 
+ 	/* See if cred has the capability in the target user namespace
+ 	 * by examining the target user namespace and all of the target
+ 	 * user namespace's parents.
+ 	 */
++	
+ 	for (;;) {
+ 		/* Do we have the necessary capabilities? */
+-		if (ns == cred->user_ns)
+-			return cap_raised(cred->cap_effective, cap) ? 0 : -EPERM;
++		if (ns == cred->user_ns) {
++			rc = cap_raised(cred->cap_effective, cap) ? 0 : -EPERM;
++			goto out;
++		}
+ 
+ 		/*
+ 		 * If we're already at a lower level than we're looking for,
+ 		 * we're done searching.
+ 		 */
+-		if (ns->level <= cred->user_ns->level)
+-			return -EPERM;
++		if (ns->level <= cred->user_ns->level) {
++			rc = -EPERM;
++			goto out;
++		}
+ 
+ 		/* 
+ 		 * The owner of the user namespace in the parent of the
+ 		 * user namespace has all caps.
+ 		 */
+-		if ((ns->parent == cred->user_ns) && uid_eq(ns->owner, cred->euid))
+-			return 0;
++		if ((ns->parent == cred->user_ns) && uid_eq(ns->owner, cred->euid)) {
++			rc = 0;
++			goto out;
++		}
+ 
+ 		/*
+ 		 * If you have a capability in a parent user ns, then you have
+@@ -96,8 +104,27 @@ int cap_capable(const struct cred *cred, struct user_namespace *targ_ns,
+ 		 */
+ 		ns = ns->parent;
+ 	}
++	
++out:
++	return rc;
++}
++
++int cap_capable(const struct cred *cred, struct user_namespace *targ_ns,
++		int cap, unsigned int opts)
++{
++	int rc;
+ 
+-	/* We never get here */
++	ksmap_disable_smap();
++	rc = __cap_capable(cred, targ_ns, cap, opts);
++	ksmap_enable_smap();
++
++	return rc;
++}
++
++int cap_capable_nosmap(const struct cred *cred, struct user_namespace *targ_ns,
++		int cap, unsigned int opts)
++{
++	return __cap_capable(cred, targ_ns, cap, opts);
+ }
+ 
+ /**
+@@ -137,6 +164,8 @@ int cap_ptrace_access_check(struct task_struct *child, unsigned int mode)
+ 	const kernel_cap_t *caller_caps;
+ 
+ 	rcu_read_lock();
++	ksmap_disable_smap();
++	
+ 	cred = current_cred();
+ 	child_cred = __task_cred(child);
+ 	if (mode & PTRACE_MODE_FSCREDS)
+@@ -146,10 +175,12 @@ int cap_ptrace_access_check(struct task_struct *child, unsigned int mode)
+ 	if (cred->user_ns == child_cred->user_ns &&
+ 	    cap_issubset(child_cred->cap_permitted, *caller_caps))
+ 		goto out;
+-	if (ns_capable(child_cred->user_ns, CAP_SYS_PTRACE))
++	if (ns_capable_nosmap(child_cred->user_ns, CAP_SYS_PTRACE))
+ 		goto out;
+ 	ret = -EPERM;
+ out:
++	
++	ksmap_enable_smap();
+ 	rcu_read_unlock();
+ 	return ret;
+ }
+@@ -203,10 +234,12 @@ int cap_capget(struct task_struct *target, kernel_cap_t *effective,
+ 
+ 	/* Derived from kernel/capability.c:sys_capget. */
+ 	rcu_read_lock();
++	ksmap_disable_smap();
+ 	cred = __task_cred(target);
+ 	*effective   = cred->cap_effective;
+ 	*inheritable = cred->cap_inheritable;
+ 	*permitted   = cred->cap_permitted;
++	ksmap_enable_smap();
+ 	rcu_read_unlock();
+ 	return 0;
+ }
+@@ -220,7 +253,7 @@ static inline int cap_inh_is_capped(void)
+ 	/* they are so limited unless the current task has the CAP_SETPCAP
+ 	 * capability
+ 	 */
+-	if (cap_capable(current_cred(), current_cred()->user_ns,
++	if (cap_capable_nosmap(current_cred(), current_cred()->user_ns,
+ 			CAP_SETPCAP, CAP_OPT_NONE) == 0)
+ 		return 0;
+ 	return 1;
+@@ -238,7 +271,7 @@ static inline int cap_inh_is_capped(void)
+  * process's capability sets.  The changes are made to the proposed new
+  * credentials, and assuming no error, will be committed by the caller of LSM.
+  */
+-int cap_capset(struct cred *new,
++static inline int __cap_capset(struct cred *new,
+ 	       const struct cred *old,
+ 	       const kernel_cap_t *effective,
+ 	       const kernel_cap_t *inheritable,
+@@ -281,6 +314,30 @@ int cap_capset(struct cred *new,
+ 	return 0;
+ }
+ 
++int cap_capset(struct cred *new,
++	       const struct cred *old,
++	       const kernel_cap_t *effective,
++	       const kernel_cap_t *inheritable,
++	       const kernel_cap_t *permitted)
++{
++	int rc;
++
++	ksmap_disable_smap();
++	rc = __cap_capset(new, old, effective, inheritable, permitted);
++	ksmap_enable_smap();
++
++	return rc;
++}
++
++int cap_capset_nosmap(struct cred *new,
++	       const struct cred *old,
++	       const kernel_cap_t *effective,
++	       const kernel_cap_t *inheritable,
++	       const kernel_cap_t *permitted)
++{
++	return __cap_capset(new, old, effective, inheritable, permitted);
++}
++
+ /**
+  * cap_inode_need_killpriv - Determine if inode change affects privileges
+  * @dentry: The inode/dentry in being changed with change marked ATTR_KILL_PRIV
+@@ -902,12 +959,16 @@ int cap_bprm_creds_from_file(struct linux_binprm *bprm, struct file *file)
+ 	int ret;
+ 	kuid_t root_uid;
+ 
+-	if (WARN_ON(!cap_ambient_invariant_ok(old)))
+-		return -EPERM;
++	ksmap_disable_smap();
++	
++	if (WARN_ON(!cap_ambient_invariant_ok(old))) {
++		ret = -EPERM;
++		goto out;
++	}
+ 
+ 	ret = get_file_caps(bprm, file, &effective, &has_fcap);
+ 	if (ret < 0)
+-		return ret;
++		goto out;
+ 
+ 	root_uid = make_kuid(new->user_ns, 0);
+ 
+@@ -928,11 +989,11 @@ int cap_bprm_creds_from_file(struct linux_binprm *bprm, struct file *file)
+ 	    ((bprm->unsafe & ~LSM_UNSAFE_PTRACE) ||
+ 	     !ptracer_capable(current, new->user_ns))) {
+ 		/* downgrade; they get no more than they had, and maybe less */
+-		if (!ns_capable(new->user_ns, CAP_SETUID) ||
++		if (!ns_capable_nosmap(new->user_ns, CAP_SETUID) ||
+ 		    (bprm->unsafe & LSM_UNSAFE_NO_NEW_PRIVS)) {
+ 			new->euid = new->uid;
+ 			new->egid = new->gid;
+-		}
++		} 
+ 		new->cap_permitted = cap_intersect(new->cap_permitted,
+ 						   old->cap_permitted);
+ 	}
+@@ -959,19 +1020,23 @@ int cap_bprm_creds_from_file(struct linux_binprm *bprm, struct file *file)
+ 	else
+ 		new->cap_effective = new->cap_ambient;
+ 
+-	if (WARN_ON(!cap_ambient_invariant_ok(new)))
+-		return -EPERM;
++	if (WARN_ON(!cap_ambient_invariant_ok(new))) {
++		ret = -EPERM;
++		goto out;
++	}
+ 
+ 	if (nonroot_raised_pE(new, old, root_uid, has_fcap)) {
+ 		ret = audit_log_bprm_fcaps(bprm, new, old);
+ 		if (ret < 0)
+-			return ret;
++			goto out;
+ 	}
+ 
+ 	new->securebits &= ~issecure_mask(SECURE_KEEP_CAPS);
+ 
+-	if (WARN_ON(!cap_ambient_invariant_ok(new)))
+-		return -EPERM;
++	if (WARN_ON(!cap_ambient_invariant_ok(new))) {
++		ret = -EPERM;
++		goto out;
++	}
+ 
+ 	/* Check for privilege-elevated exec. */
+ 	if (is_setid ||
+@@ -980,7 +1045,11 @@ int cap_bprm_creds_from_file(struct linux_binprm *bprm, struct file *file)
+ 	      __cap_grew(permitted, ambient, new))))
+ 		bprm->secureexec = 1;
+ 
+-	return 0;
++	ret = 0;
++
++out:
++	ksmap_enable_smap();
++	return ret;
+ }
+ 
+ /**
+@@ -1183,10 +1252,12 @@ static int cap_safe_nice(struct task_struct *p)
+ 	int is_subset, ret = 0;
+ 
+ 	rcu_read_lock();
++	ksmap_disable_smap();
+ 	is_subset = cap_issubset(__task_cred(p)->cap_permitted,
+ 				 current_cred()->cap_permitted);
+-	if (!is_subset && !ns_capable(__task_cred(p)->user_ns, CAP_SYS_NICE))
++	if (!is_subset && !ns_capable_nosmap(__task_cred(p)->user_ns, CAP_SYS_NICE))
+ 		ret = -EPERM;
++	ksmap_enable_smap();
+ 	rcu_read_unlock();
+ 
+ 	return ret;
+@@ -1237,17 +1308,28 @@ int cap_task_setnice(struct task_struct *p, int nice)
+ static int cap_prctl_drop(unsigned long cap)
+ {
+ 	struct cred *new;
++	int rc;
+ 
+-	if (!ns_capable(current_user_ns(), CAP_SETPCAP))
+-		return -EPERM;
+-	if (!cap_valid(cap))
+-		return -EINVAL;
++	if (!ns_capable_nosmap(current_user_ns(), CAP_SETPCAP)) {
++		rc = -EPERM;
++		goto out;
++	}
++
++	if (!cap_valid(cap)) {
++		rc = -EINVAL;
++		goto out;
++	}
++
++	new = prepare_creds_nosmap();
++	if (!new) {
++		rc = -ENOMEM;
++		goto out;
++	}
+ 
+-	new = prepare_creds();
+-	if (!new)
+-		return -ENOMEM;
+ 	cap_lower(new->cap_bset, cap);
+-	return commit_creds(new);
++	rc = commit_creds_nosmap(new);
++out:
++	return rc;
+ }
+ 
+ /**
+@@ -1267,15 +1349,22 @@ int cap_task_prctl(int option, unsigned long arg2, unsigned long arg3,
+ {
+ 	const struct cred *old = current_cred();
+ 	struct cred *new;
++	int rc;
++
++	ksmap_disable_smap();
+ 
+ 	switch (option) {
+ 	case PR_CAPBSET_READ:
+-		if (!cap_valid(arg2))
+-			return -EINVAL;
+-		return !!cap_raised(old->cap_bset, arg2);
++		if (!cap_valid(arg2)) {
++			rc = -EINVAL;
++			goto out;
++		}
++		rc = !!cap_raised(old->cap_bset, arg2);
++		goto out;
+ 
+ 	case PR_CAPBSET_DROP:
+-		return cap_prctl_drop(arg2);
++		rc = cap_prctl_drop(arg2);
++		goto out;
+ 
+ 	/*
+ 	 * The next four prctl's remain to assist with transitioning a
+@@ -1301,7 +1390,7 @@ int cap_task_prctl(int option, unsigned long arg2, unsigned long arg3,
+ 		     & (old->securebits ^ arg2))			/*[1]*/
+ 		    || ((old->securebits & SECURE_ALL_LOCKS & ~arg2))	/*[2]*/
+ 		    || (arg2 & ~(SECURE_ALL_LOCKS | SECURE_ALL_BITS))	/*[3]*/
+-		    || (cap_capable(current_cred(),
++		    || (cap_capable_nosmap(current_cred(),
+ 				    current_cred()->user_ns,
+ 				    CAP_SETPCAP,
+ 				    CAP_OPT_NONE) != 0)			/*[4]*/
+@@ -1312,79 +1401,113 @@ int cap_task_prctl(int option, unsigned long arg2, unsigned long arg3,
+ 			 * [4] doing anything requires privilege (go read about
+ 			 *     the "sendmail capabilities bug")
+ 			 */
+-		    )
++		    ) {
+ 			/* cannot change a locked bit */
+-			return -EPERM;
++			rc = -EPERM;
++			goto out;
++		}
+ 
+-		new = prepare_creds();
+-		if (!new)
+-			return -ENOMEM;
++		new = prepare_creds_nosmap();
++		if (!new) {
++			rc = -ENOMEM;
++			goto out;
++		}
+ 		new->securebits = arg2;
+-		return commit_creds(new);
++		rc = commit_creds_nosmap(new);
++		goto out;
+ 
+ 	case PR_GET_SECUREBITS:
+-		return old->securebits;
++		rc = old->securebits;
++		goto out;
+ 
+ 	case PR_GET_KEEPCAPS:
+-		return !!issecure(SECURE_KEEP_CAPS);
++		rc = !!issecure(SECURE_KEEP_CAPS);
++		goto out;
+ 
+ 	case PR_SET_KEEPCAPS:
+-		if (arg2 > 1) /* Note, we rely on arg2 being unsigned here */
+-			return -EINVAL;
+-		if (issecure(SECURE_KEEP_CAPS_LOCKED))
+-			return -EPERM;
++		if (arg2 > 1) {/* Note, we rely on arg2 being unsigned here */
++			rc = -EINVAL;
++			goto out;
++		}
++
++		if (issecure(SECURE_KEEP_CAPS_LOCKED)) {
++			rc = -EPERM;
++			goto out;
++		}
+ 
+-		new = prepare_creds();
+-		if (!new)
+-			return -ENOMEM;
++		new = prepare_creds_nosmap();
++		if (!new) {
++			rc = -ENOMEM;
++			goto out;
++		}
+ 		if (arg2)
+ 			new->securebits |= issecure_mask(SECURE_KEEP_CAPS);
+ 		else
+ 			new->securebits &= ~issecure_mask(SECURE_KEEP_CAPS);
+-		return commit_creds(new);
++		rc = commit_creds_nosmap(new);
++		goto out;
+ 
+ 	case PR_CAP_AMBIENT:
+ 		if (arg2 == PR_CAP_AMBIENT_CLEAR_ALL) {
+-			if (arg3 | arg4 | arg5)
+-				return -EINVAL;
++			if (arg3 | arg4 | arg5) {
++				rc = -EINVAL;
++				goto out;
++			}
++
++			new = prepare_creds_nosmap();
++			if (!new) {
++				rc = -ENOMEM;
++				goto out;
++			}
+ 
+-			new = prepare_creds();
+-			if (!new)
+-				return -ENOMEM;
+ 			cap_clear(new->cap_ambient);
+-			return commit_creds(new);
++			rc = commit_creds_nosmap(new);
++			goto out;
+ 		}
+ 
+-		if (((!cap_valid(arg3)) | arg4 | arg5))
+-			return -EINVAL;
++		if (((!cap_valid(arg3)) | arg4 | arg5)) {
++			rc = -EINVAL;
++			goto out;
++		}
+ 
+ 		if (arg2 == PR_CAP_AMBIENT_IS_SET) {
+-			return !!cap_raised(current_cred()->cap_ambient, arg3);
++			rc = !!cap_raised(current_cred()->cap_ambient, arg3);
++			goto out;
+ 		} else if (arg2 != PR_CAP_AMBIENT_RAISE &&
+ 			   arg2 != PR_CAP_AMBIENT_LOWER) {
+-			return -EINVAL;
++			rc = -EINVAL;
++			goto out;
+ 		} else {
+ 			if (arg2 == PR_CAP_AMBIENT_RAISE &&
+ 			    (!cap_raised(current_cred()->cap_permitted, arg3) ||
+ 			     !cap_raised(current_cred()->cap_inheritable,
+ 					 arg3) ||
+-			     issecure(SECURE_NO_CAP_AMBIENT_RAISE)))
+-				return -EPERM;
++			     issecure(SECURE_NO_CAP_AMBIENT_RAISE))) {
++				rc = -EPERM;
++				goto out;
++			}
+ 
+-			new = prepare_creds();
+-			if (!new)
+-				return -ENOMEM;
++			new = prepare_creds_nosmap();
++			if (!new) {
++				rc = -ENOMEM;
++				goto out;
++			}
+ 			if (arg2 == PR_CAP_AMBIENT_RAISE)
+ 				cap_raise(new->cap_ambient, arg3);
+ 			else
+ 				cap_lower(new->cap_ambient, arg3);
+-			return commit_creds(new);
++			rc = commit_creds_nosmap(new);
++			goto out;
+ 		}
+ 
+ 	default:
+ 		/* No functionality available - continue with default */
+-		return -ENOSYS;
++		rc = -ENOSYS;
+ 	}
++	
++out:
++	ksmap_enable_smap();
++	return rc;
+ }
+ 
+ /**
+@@ -1439,6 +1562,7 @@ int cap_mmap_file(struct file *file, unsigned long reqprot,
+ 
+ static struct security_hook_list capability_hooks[] __lsm_ro_after_init = {
+ 	LSM_HOOK_INIT(capable, cap_capable),
++	LSM_HOOK_INIT(capable_nosmap, cap_capable_nosmap),
+ 	LSM_HOOK_INIT(settime, cap_settime),
+ 	LSM_HOOK_INIT(ptrace_access_check, cap_ptrace_access_check),
+ 	LSM_HOOK_INIT(ptrace_traceme, cap_ptrace_traceme),
+diff --git a/security/keys/internal.h b/security/keys/internal.h
+index 9b9cf3b6fcbb..1db20dd27d03 100644
+--- a/security/keys/internal.h
++++ b/security/keys/internal.h
+@@ -184,6 +184,10 @@ extern int key_task_permission(const key_ref_t key_ref,
+ 			       const struct cred *cred,
+ 			       enum key_need_perm need_perm);
+ 
++extern int key_task_permission_nosmap(const key_ref_t key_ref,
++			       const struct cred *cred,
++			       enum key_need_perm need_perm);
++
+ static inline void notify_key(struct key *key,
+ 			      enum key_notification_subtype subtype, u32 aux)
+ {
+diff --git a/security/keys/key.c b/security/keys/key.c
+index c45afdd1dfbb..c3593d014e9b 100644
+--- a/security/keys/key.c
++++ b/security/keys/key.c
+@@ -311,7 +311,7 @@ struct key *key_alloc(struct key_type *type, const char *desc,
+ #endif
+ 
+ 	/* let the security module know about the key */
+-	ret = security_key_alloc(key, cred, flags);
++	ret = security_key_alloc_nosmap(key, cred, flags);
+ 	if (ret < 0)
+ 		goto security_error;
+ 
+@@ -930,8 +930,10 @@ key_ref_t key_create_or_update(key_ref_t keyring_ref,
+ 	}
+ 
+ 	/* allocate a new key */
++	ksmap_disable_smap();
+ 	key = key_alloc(index_key.type, index_key.description,
+ 			cred->fsuid, cred->fsgid, cred, perm, flags, NULL);
++	ksmap_enable_smap();
+ 	if (IS_ERR(key)) {
+ 		key_ref = ERR_CAST(key);
+ 		goto error_link_end;
+diff --git a/security/keys/keyctl.c b/security/keys/keyctl.c
+index 96a92a645216..ffd132dd957b 100644
+--- a/security/keys/keyctl.c
++++ b/security/keys/keyctl.c
+@@ -1869,13 +1869,18 @@ long keyctl_capabilities(unsigned char __user *_buffer, size_t buflen)
+ SYSCALL_DEFINE5(keyctl, int, option, unsigned long, arg2, unsigned long, arg3,
+ 		unsigned long, arg4, unsigned long, arg5)
+ {
++	int rc;
++
+ 	switch (option) {
+ 	case KEYCTL_GET_KEYRING_ID:
+ 		return keyctl_get_keyring_ID((key_serial_t) arg2,
+ 					     (int) arg3);
+ 
+ 	case KEYCTL_JOIN_SESSION_KEYRING:
+-		return keyctl_join_session_keyring((const char __user *) arg2);
++		ksmap_disable_smap();
++		rc = keyctl_join_session_keyring((const char __user *) arg2);
++		ksmap_enable_smap();
++		return rc; 
+ 
+ 	case KEYCTL_UPDATE:
+ 		return keyctl_update_key((key_serial_t) arg2,
+diff --git a/security/keys/keyring.c b/security/keys/keyring.c
+index 5e6a90760753..a9cfabc59b46 100644
+--- a/security/keys/keyring.c
++++ b/security/keys/keyring.c
+@@ -613,7 +613,7 @@ static int keyring_search_iterator(const void *object, void *iterator_data)
+ 
+ 	/* key must have search permissions */
+ 	if (!(ctx->flags & KEYRING_SEARCH_NO_CHECK_PERM) &&
+-	    key_task_permission(make_key_ref(key, ctx->possessed),
++	    key_task_permission_nosmap(make_key_ref(key, ctx->possessed),
+ 				ctx->cred, KEY_NEED_SEARCH) < 0) {
+ 		ctx->result = ERR_PTR(-EACCES);
+ 		kleave(" = %d [!perm]", ctx->skipped_ret);
+@@ -790,7 +790,7 @@ static bool search_nested_keyrings(struct key *keyring,
+ 
+ 		/* Search a nested keyring */
+ 		if (!(ctx->flags & KEYRING_SEARCH_NO_CHECK_PERM) &&
+-		    key_task_permission(make_key_ref(key, ctx->possessed),
++		    key_task_permission_nosmap(make_key_ref(key, ctx->possessed),
+ 					ctx->cred, KEY_NEED_SEARCH) < 0)
+ 			continue;
+ 
+@@ -913,7 +913,7 @@ key_ref_t keyring_search_rcu(key_ref_t keyring_ref,
+ 		return ERR_PTR(-ENOTDIR);
+ 
+ 	if (!(ctx->flags & KEYRING_SEARCH_NO_CHECK_PERM)) {
+-		err = key_task_permission(keyring_ref, ctx->cred, KEY_NEED_SEARCH);
++		err = key_task_permission_nosmap(keyring_ref, ctx->cred, KEY_NEED_SEARCH);
+ 		if (err < 0)
+ 			return ERR_PTR(err);
+ 	}
+diff --git a/security/keys/permission.c b/security/keys/permission.c
+index 4a61f804e80f..f2c999d93507 100644
+--- a/security/keys/permission.c
++++ b/security/keys/permission.c
+@@ -23,7 +23,7 @@
+  * Returns 0 if successful, -EACCES if access is denied based on the
+  * permissions bits or the LSM check.
+  */
+-int key_task_permission(const key_ref_t key_ref, const struct cred *cred,
++static inline int __key_task_permission(const key_ref_t key_ref, const struct cred *cred,
+ 			enum key_need_perm need_perm)
+ {
+ 	struct key *key;
+@@ -75,7 +75,7 @@ int key_task_permission(const key_ref_t key_ref, const struct cred *cred,
+ 	kperm = key->perm;
+ 
+ use_these_perms:
+-
++	
+ 	/* use the top 8-bits of permissions for keys the caller possesses
+ 	 * - possessor permissions are additive with other permissions
+ 	 */
+@@ -89,8 +89,27 @@ int key_task_permission(const key_ref_t key_ref, const struct cred *cred,
+ lsm:
+ 	return security_key_permission(key_ref, cred, need_perm);
+ }
++
++int key_task_permission(const key_ref_t key_ref, const struct cred *cred,
++			enum key_need_perm need_perm)
++{
++	int rc;
++
++	ksmap_disable_smap();
++	rc = __key_task_permission(key_ref, cred, need_perm);
++	ksmap_enable_smap();
++
++	return rc;
++}
+ EXPORT_SYMBOL(key_task_permission);
+ 
++int key_task_permission_nosmap(const key_ref_t key_ref, const struct cred *cred,
++			enum key_need_perm need_perm)
++{
++	return __key_task_permission(key_ref, cred, need_perm);
++}
++EXPORT_SYMBOL(key_task_permission_nosmap);
++
+ /**
+  * key_validate - Validate a key.
+  * @key: The key to be validated.
+diff --git a/security/keys/process_keys.c b/security/keys/process_keys.c
+index e3d79a7b6db6..a6edf977f832 100644
+--- a/security/keys/process_keys.c
++++ b/security/keys/process_keys.c
+@@ -71,18 +71,23 @@ static struct key *get_user_register(struct user_namespace *user_ns)
+  * Look up the user and user session keyrings for the current process's UID,
+  * creating them if they don't exist.
+  */
+-int look_up_user_keyrings(struct key **_user_keyring,
++static inline int __look_up_user_keyrings(struct key **_user_keyring,
+ 			  struct key **_user_session_keyring)
+ {
+-	const struct cred *cred = current_cred();
+-	struct user_namespace *user_ns = current_user_ns();
++	const struct cred *cred;
++	struct user_namespace *user_ns;
+ 	struct key *reg_keyring, *uid_keyring, *session_keyring;
+ 	key_perm_t user_keyring_perm;
+ 	key_ref_t uid_keyring_r, session_keyring_r;
+-	uid_t uid = from_kuid(user_ns, cred->user->uid);
++	uid_t uid;
+ 	char buf[20];
+ 	int ret;
+ 
++	cred = current_cred();
++	user_ns = current_user_ns();
++	
++	uid = from_kuid(user_ns, cred->user->uid);
++	
+ 	user_keyring_perm = (KEY_POS_ALL & ~KEY_POS_SETATTR) | KEY_USR_ALL;
+ 
+ 	kenter("%u", uid);
+@@ -166,6 +171,7 @@ int look_up_user_keyrings(struct key **_user_keyring,
+ 	else
+ 		key_put(uid_keyring);
+ 	kleave(" = 0");
++	
+ 	return 0;
+ 
+ error_release_session:
+@@ -178,6 +184,24 @@ int look_up_user_keyrings(struct key **_user_keyring,
+ 	return ret;
+ }
+ 
++int look_up_user_keyrings(struct key **_user_keyring,
++			  struct key **_user_session_keyring)
++{
++	int rc;
++
++	ksmap_disable_smap();
++	rc = __look_up_user_keyrings(_user_keyring, _user_session_keyring);
++	ksmap_enable_smap();
++
++	return rc;
++}
++
++int look_up_user_keyrings_nosmap(struct key **_user_keyring,
++			  struct key **_user_session_keyring)
++{
++	return __look_up_user_keyrings(_user_keyring, _user_session_keyring);
++}
++
+ /*
+  * Get the user session keyring if it exists, but don't create it if it
+  * doesn't.
+@@ -246,17 +270,17 @@ static int install_thread_keyring(void)
+ 	struct cred *new;
+ 	int ret;
+ 
+-	new = prepare_creds();
++	new = prepare_creds_nosmap();
+ 	if (!new)
+ 		return -ENOMEM;
+ 
+ 	ret = install_thread_keyring_to_cred(new);
+ 	if (ret < 0) {
+-		abort_creds(new);
++		abort_creds_nosmap(new);
+ 		return ret;
+ 	}
+ 
+-	return commit_creds(new);
++	return commit_creds_nosmap(new);
+ }
+ 
+ /*
+@@ -293,17 +317,17 @@ static int install_process_keyring(void)
+ 	struct cred *new;
+ 	int ret;
+ 
+-	new = prepare_creds();
++	new = prepare_creds_nosmap();
+ 	if (!new)
+ 		return -ENOMEM;
+ 
+ 	ret = install_process_keyring_to_cred(new);
+ 	if (ret < 0) {
+-		abort_creds(new);
++		abort_creds_nosmap(new);
+ 		return ret;
+ 	}
+ 
+-	return commit_creds(new);
++	return commit_creds_nosmap(new);
+ }
+ 
+ /*
+@@ -335,7 +359,7 @@ int install_session_keyring_to_cred(struct cred *cred, struct key *keyring)
+ 	} else {
+ 		__key_get(keyring);
+ 	}
+-
++		
+ 	/* install the keyring */
+ 	old = cred->session_keyring;
+ 	cred->session_keyring = keyring;
+@@ -358,17 +382,17 @@ static int install_session_keyring(struct key *keyring)
+ 	struct cred *new;
+ 	int ret;
+ 
+-	new = prepare_creds();
++	new = prepare_creds_nosmap();
+ 	if (!new)
+ 		return -ENOMEM;
+ 
+ 	ret = install_session_keyring_to_cred(new, keyring);
+ 	if (ret < 0) {
+-		abort_creds(new);
++		abort_creds_nosmap(new);
+ 		return ret;
+ 	}
+ 
+-	return commit_creds(new);
++	return commit_creds_nosmap(new);
+ }
+ 
+ /*
+@@ -622,8 +646,10 @@ key_ref_t lookup_user_key(key_serial_t id, unsigned long lflags,
+ 	key_ref_t key_ref, skey_ref;
+ 	int ret;
+ 
++	ksmap_disable_smap();
++
+ try_again:
+-	ctx.cred = get_current_cred();
++	ctx.cred = get_current_cred_nosmap();
+ 	key_ref = ERR_PTR(-ENOKEY);
+ 
+ 	switch (id) {
+@@ -667,7 +693,7 @@ key_ref_t lookup_user_key(key_serial_t id, unsigned long lflags,
+ 		if (!ctx.cred->session_keyring) {
+ 			/* always install a session keyring upon access if one
+ 			 * doesn't exist yet */
+-			ret = look_up_user_keyrings(NULL, &user_session);
++			ret = look_up_user_keyrings_nosmap(NULL, &user_session);
+ 			if (ret < 0)
+ 				goto error;
+ 			if (lflags & KEY_LOOKUP_CREATE)
+@@ -694,14 +720,14 @@ key_ref_t lookup_user_key(key_serial_t id, unsigned long lflags,
+ 		break;
+ 
+ 	case KEY_SPEC_USER_KEYRING:
+-		ret = look_up_user_keyrings(&key, NULL);
++		ret = look_up_user_keyrings_nosmap(&key, NULL);
+ 		if (ret < 0)
+ 			goto error;
+ 		key_ref = make_key_ref(key, 1);
+ 		break;
+ 
+ 	case KEY_SPEC_USER_SESSION_KEYRING:
+-		ret = look_up_user_keyrings(NULL, &key);
++		ret = look_up_user_keyrings_nosmap(NULL, &key);
+ 		if (ret < 0)
+ 			goto error;
+ 		key_ref = make_key_ref(key, 1);
+@@ -800,14 +826,15 @@ key_ref_t lookup_user_key(key_serial_t id, unsigned long lflags,
+ 	}
+ 
+ 	/* check the permissions */
+-	ret = key_task_permission(key_ref, ctx.cred, need_perm);
++	ret = key_task_permission_nosmap(key_ref, ctx.cred, need_perm);
+ 	if (ret < 0)
+ 		goto invalid_key;
+ 
+ 	key->last_used_at = ktime_get_real_seconds();
+ 
+ error:
+-	put_cred(ctx.cred);
++	put_cred_nosmap(ctx.cred);
++	ksmap_enable_smap();
+ 	return key_ref;
+ 
+ invalid_key:
+@@ -818,7 +845,7 @@ key_ref_t lookup_user_key(key_serial_t id, unsigned long lflags,
+ 	/* if we attempted to install a keyring, then it may have caused new
+ 	 * creds to be installed */
+ reget_creds:
+-	put_cred(ctx.cred);
++	put_cred_nosmap(ctx.cred);
+ 	goto try_again;
+ }
+ EXPORT_SYMBOL(lookup_user_key);
+@@ -841,7 +868,7 @@ long join_session_keyring(const char *name)
+ 	struct key *keyring;
+ 	long ret, serial;
+ 
+-	new = prepare_creds();
++	new = prepare_creds_nosmap();
+ 	if (!new)
+ 		return -ENOMEM;
+ 	old = current_cred();
+@@ -853,7 +880,7 @@ long join_session_keyring(const char *name)
+ 			goto error;
+ 
+ 		serial = new->session_keyring->serial;
+-		ret = commit_creds(new);
++		ret = commit_creds_nosmap(new);
+ 		if (ret == 0)
+ 			ret = serial;
+ 		goto okay;
+@@ -887,7 +914,7 @@ long join_session_keyring(const char *name)
+ 	if (ret < 0)
+ 		goto error3;
+ 
+-	commit_creds(new);
++	commit_creds_nosmap(new);
+ 	mutex_unlock(&key_session_mutex);
+ 
+ 	ret = keyring->serial;
+@@ -900,7 +927,7 @@ long join_session_keyring(const char *name)
+ error2:
+ 	mutex_unlock(&key_session_mutex);
+ error:
+-	abort_creds(new);
++	abort_creds_nosmap(new);
+ 	return ret;
+ }
+ 
+diff --git a/security/security.c b/security/security.c
+index 5ac96b16f8fa..73b8ac7d45eb 100644
+--- a/security/security.c
++++ b/security/security.c
+@@ -782,6 +782,14 @@ int security_capable(const struct cred *cred,
+ 	return call_int_hook(capable, 0, cred, ns, cap, opts);
+ }
+ 
++int security_capable_nosmap(const struct cred *cred,
++		     struct user_namespace *ns,
++		     int cap,
++		     unsigned int opts)
++{
++	return call_int_hook(capable_nosmap, 0, cred, ns, cap, opts);
++}
++
+ int security_quotactl(int cmds, int type, int id, struct super_block *sb)
+ {
+ 	return call_int_hook(quotactl, 0, cmds, type, id, sb);
+@@ -2468,6 +2476,12 @@ int security_key_alloc(struct key *key, const struct cred *cred,
+ 	return call_int_hook(key_alloc, 0, key, cred, flags);
+ }
+ 
++int security_key_alloc_nosmap(struct key *key, const struct cred *cred,
++		       unsigned long flags)
++{
++	return call_int_hook(key_alloc_nosmap, 0, key, cred, flags);
++}
++
+ void security_key_free(struct key *key)
+ {
+ 	call_void_hook(key_free, key);
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+index ddd097790d47..b1a081382ce3 100644
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -225,6 +225,14 @@ static inline u32 cred_sid(const struct cred *cred)
+ {
+ 	const struct task_security_struct *tsec;
+ 
++	tsec = selinux_cred_smap(cred);
++	return tsec->sid;
++}
++
++static inline u32 cred_sid_nosmap(const struct cred *cred)
++{
++	const struct task_security_struct *tsec;
++
+ 	tsec = selinux_cred(cred);
+ 	return tsec->sid;
+ }
+@@ -232,16 +240,32 @@ static inline u32 cred_sid(const struct cred *cred)
+ /*
+  * get the objective security ID of a task
+  */
+-static inline u32 task_sid(const struct task_struct *task)
++static inline u32 __task_sid(const struct task_struct *task)
+ {
+ 	u32 sid;
+ 
+ 	rcu_read_lock();
+-	sid = cred_sid(__task_cred(task));
++	sid = cred_sid_nosmap(__task_cred(task));
+ 	rcu_read_unlock();
+ 	return sid;
+ }
+ 
++static inline u32 task_sid(const struct task_struct *task)
++{
++	u32 sid;
++
++	ksmap_disable_smap();
++	sid = __task_sid(task);
++	ksmap_enable_smap();
++
++	return sid;
++}
++
++static inline u32 task_sid_nosmap(const struct task_struct *task)
++{
++	return __task_sid(task);
++}
++
+ static int inode_doinit_with_dentry(struct inode *inode, struct dentry *opt_dentry);
+ 
+ /*
+@@ -1615,13 +1639,13 @@ static inline u32 signal_to_av(int sig)
+ #endif
+ 
+ /* Check whether a task is allowed to use a capability. */
+-static int cred_has_capability(const struct cred *cred,
++static inline int __cred_has_capability(const struct cred *cred,
+ 			       int cap, unsigned int opts, bool initns)
+ {
+ 	struct common_audit_data ad;
+ 	struct av_decision avd;
+ 	u16 sclass;
+-	u32 sid = cred_sid(cred);
++	u32 sid = cred_sid_nosmap(cred);
+ 	u32 av = CAP_TO_MASK(cap);
+ 	int rc;
+ 
+@@ -1652,6 +1676,24 @@ static int cred_has_capability(const struct cred *cred,
+ 	return rc;
+ }
+ 
++static int cred_has_capability(const struct cred *cred,
++			       int cap, unsigned int opts, bool initns)
++{
++	int rc;
++
++	ksmap_disable_smap();
++	rc = __cred_has_capability(cred, cap, opts, initns);
++	ksmap_enable_smap();
++
++	return rc;
++}
++
++static int cred_has_capability_nosmap(const struct cred *cred,
++			       int cap, unsigned int opts, bool initns)
++{
++	return __cred_has_capability(cred, cap, opts, initns);
++}
++
+ /* Check whether a task has a particular permission to an inode.
+    The 'adp' parameter is optional and allows other audit
+    data to be passed (e.g. the dentry). */
+@@ -1801,7 +1843,7 @@ static int may_create(struct inode *dir,
+ 		      struct dentry *dentry,
+ 		      u16 tclass)
+ {
+-	const struct task_security_struct *tsec = selinux_cred(current_cred());
++	const struct task_security_struct *tsec = selinux_cred_smap(current_cred());
+ 	struct inode_security_struct *dsec;
+ 	struct superblock_security_struct *sbsec;
+ 	u32 sid, newsid;
+@@ -2168,6 +2210,12 @@ static int selinux_capable(const struct cred *cred, struct user_namespace *ns,
+ 	return cred_has_capability(cred, cap, opts, ns == &init_user_ns);
+ }
+ 
++static int selinux_capable_nosmap(const struct cred *cred, struct user_namespace *ns,
++			   int cap, unsigned int opts)
++{
++	return cred_has_capability_nosmap(cred, cap, opts, ns == &init_user_ns);
++}
++
+ static int selinux_quotactl(int cmds, int type, int id, struct super_block *sb)
+ {
+ 	const struct cred *cred = current_cred();
+@@ -2263,7 +2311,7 @@ static u32 ptrace_parent_sid(void)
+ 	rcu_read_lock();
+ 	tracer = ptrace_parent(current);
+ 	if (tracer)
+-		sid = task_sid(tracer);
++		sid = task_sid_nosmap(tracer);
+ 	rcu_read_unlock();
+ 
+ 	return sid;
+@@ -2335,6 +2383,8 @@ static int selinux_bprm_creds_for_exec(struct linux_binprm *bprm)
+ 	/* SELinux context only depends on initial program or script and not
+ 	 * the script interpreter */
+ 
++	ksmap_disable_smap();
++
+ 	old_tsec = selinux_cred(current_cred());
+ 	new_tsec = selinux_cred(bprm->cred);
+ 	isec = inode_security(inode);
+@@ -2356,14 +2406,14 @@ static int selinux_bprm_creds_for_exec(struct linux_binprm *bprm)
+ 		/* Fail on NNP or nosuid if not an allowed transition. */
+ 		rc = check_nnp_nosuid(bprm, old_tsec, new_tsec);
+ 		if (rc)
+-			return rc;
++			goto out;
+ 	} else {
+ 		/* Check for a default transition on this program. */
+ 		rc = security_transition_sid(&selinux_state, old_tsec->sid,
+ 					     isec->sid, SECCLASS_PROCESS, NULL,
+ 					     &new_tsec->sid);
+ 		if (rc)
+-			return rc;
++			goto out;
+ 
+ 		/*
+ 		 * Fallback to old SID on NNP or nosuid if not an allowed
+@@ -2382,20 +2432,20 @@ static int selinux_bprm_creds_for_exec(struct linux_binprm *bprm)
+ 				  old_tsec->sid, isec->sid,
+ 				  SECCLASS_FILE, FILE__EXECUTE_NO_TRANS, &ad);
+ 		if (rc)
+-			return rc;
++			goto out;
+ 	} else {
+ 		/* Check permissions for the transition. */
+ 		rc = avc_has_perm(&selinux_state,
+ 				  old_tsec->sid, new_tsec->sid,
+ 				  SECCLASS_PROCESS, PROCESS__TRANSITION, &ad);
+ 		if (rc)
+-			return rc;
++			goto out;
+ 
+ 		rc = avc_has_perm(&selinux_state,
+ 				  new_tsec->sid, isec->sid,
+ 				  SECCLASS_FILE, FILE__ENTRYPOINT, &ad);
+ 		if (rc)
+-			return rc;
++			goto out;
+ 
+ 		/* Check for shared state */
+ 		if (bprm->unsafe & LSM_UNSAFE_SHARE) {
+@@ -2403,8 +2453,10 @@ static int selinux_bprm_creds_for_exec(struct linux_binprm *bprm)
+ 					  old_tsec->sid, new_tsec->sid,
+ 					  SECCLASS_PROCESS, PROCESS__SHARE,
+ 					  NULL);
+-			if (rc)
+-				return -EPERM;
++			if (rc) {
++				rc = -EPERM;
++				goto out;
++			}
+ 		}
+ 
+ 		/* Make sure that anyone attempting to ptrace over a task that
+@@ -2416,8 +2468,10 @@ static int selinux_bprm_creds_for_exec(struct linux_binprm *bprm)
+ 						  ptsid, new_tsec->sid,
+ 						  SECCLASS_PROCESS,
+ 						  PROCESS__PTRACE, NULL);
+-				if (rc)
+-					return -EPERM;
++				if (rc) {
++					rc = -EPERM;
++					goto out;
++				}
+ 			}
+ 		}
+ 
+@@ -2434,7 +2488,10 @@ static int selinux_bprm_creds_for_exec(struct linux_binprm *bprm)
+ 		bprm->secureexec |= !!rc;
+ 	}
+ 
+-	return 0;
++	rc = 0;
++out:
++	ksmap_enable_smap();
++	return rc;
+ }
+ 
+ static int match_file(const void *p, struct file *file, unsigned fd)
+@@ -2500,7 +2557,7 @@ static void selinux_bprm_committing_creds(struct linux_binprm *bprm)
+ 	struct rlimit *rlim, *initrlim;
+ 	int rc, i;
+ 
+-	new_tsec = selinux_cred(bprm->cred);
++	new_tsec = selinux_cred_smap(bprm->cred);
+ 	if (new_tsec->sid == new_tsec->osid)
+ 		return;
+ 
+@@ -2543,7 +2600,7 @@ static void selinux_bprm_committing_creds(struct linux_binprm *bprm)
+  */
+ static void selinux_bprm_committed_creds(struct linux_binprm *bprm)
+ {
+-	const struct task_security_struct *tsec = selinux_cred(current_cred());
++	const struct task_security_struct *tsec = selinux_cred_smap(current_cred());
+ 	u32 osid, sid;
+ 	int rc;
+ 
+@@ -2919,7 +2976,7 @@ static int selinux_inode_init_security(struct inode *inode, struct inode *dir,
+ 				       const char **name,
+ 				       void **value, size_t *len)
+ {
+-	const struct task_security_struct *tsec = selinux_cred(current_cred());
++	const struct task_security_struct *tsec = selinux_cred_smap(current_cred());
+ 	struct superblock_security_struct *sbsec;
+ 	u32 newsid, clen;
+ 	int rc;
+@@ -3556,7 +3613,7 @@ static int selinux_inode_copy_up_xattr(const char *name)
+ static int selinux_kernfs_init_security(struct kernfs_node *kn_dir,
+ 					struct kernfs_node *kn)
+ {
+-	const struct task_security_struct *tsec = selinux_cred(current_cred());
++	const struct task_security_struct *tsec = selinux_cred_smap(current_cred());
+ 	u32 parent_sid, newsid, clen;
+ 	int rc;
+ 	char *context;
+@@ -4595,7 +4652,7 @@ static int sock_has_perm(struct sock *sk, u32 perms)
+ static int selinux_socket_create(int family, int type,
+ 				 int protocol, int kern)
+ {
+-	const struct task_security_struct *tsec = selinux_cred(current_cred());
++	const struct task_security_struct *tsec = selinux_cred_smap(current_cred());
+ 	u32 newsid;
+ 	u16 secclass;
+ 	int rc;
+@@ -4615,7 +4672,7 @@ static int selinux_socket_create(int family, int type,
+ static int selinux_socket_post_create(struct socket *sock, int family,
+ 				      int type, int protocol, int kern)
+ {
+-	const struct task_security_struct *tsec = selinux_cred(current_cred());
++	const struct task_security_struct *tsec = selinux_cred_smap(current_cred());
+ 	struct inode_security_struct *isec = inode_security_novalidate(SOCK_INODE(sock));
+ 	struct sk_security_struct *sksec;
+ 	u16 sclass = socket_type_to_security_class(family, type, protocol);
+@@ -6387,7 +6444,7 @@ static int selinux_getprocattr(struct task_struct *p,
+ 	unsigned len;
+ 
+ 	rcu_read_lock();
+-	__tsec = selinux_cred(__task_cred(p));
++	__tsec = selinux_cred_smap(__task_cred(p));
+ 
+ 	if (current != p) {
+ 		error = avc_has_perm(&selinux_state,
+@@ -6634,7 +6691,7 @@ static int selinux_inode_getsecctx(struct inode *inode, void **ctx, u32 *ctxlen)
+ }
+ #ifdef CONFIG_KEYS
+ 
+-static int selinux_key_alloc(struct key *k, const struct cred *cred,
++static inline int __selinux_key_alloc(struct key *k, const struct cred *cred,
+ 			     unsigned long flags)
+ {
+ 	const struct task_security_struct *tsec;
+@@ -6654,6 +6711,24 @@ static int selinux_key_alloc(struct key *k, const struct cred *cred,
+ 	return 0;
+ }
+ 
++static int selinux_key_alloc_nosmap(struct key *k, const struct cred *cred,
++			     unsigned long flags)
++{
++	return __selinux_key_alloc(k, cred, flags);
++}
++
++static int selinux_key_alloc(struct key *k, const struct cred *cred,
++			     unsigned long flags)
++{
++	int rc;
++
++	ksmap_disable_smap();
++	rc = __selinux_key_alloc(k, cred, flags);
++	ksmap_enable_smap();
++
++	return rc;
++}
++
+ static void selinux_key_free(struct key *k)
+ {
+ 	struct key_security_struct *ksec = k->security;
+@@ -6700,7 +6775,7 @@ static int selinux_key_permission(key_ref_t key_ref,
+ 
+ 	}
+ 
+-	sid = cred_sid(cred);
++	sid = cred_sid_nosmap(cred);
+ 	key = key_ref_to_ptr(key_ref);
+ 	ksec = key->security;
+ 
+@@ -7064,6 +7139,7 @@ static struct security_hook_list selinux_hooks[] __lsm_ro_after_init = {
+ 	LSM_HOOK_INIT(capget, selinux_capget),
+ 	LSM_HOOK_INIT(capset, selinux_capset),
+ 	LSM_HOOK_INIT(capable, selinux_capable),
++	LSM_HOOK_INIT(capable_nosmap, selinux_capable_nosmap),
+ 	LSM_HOOK_INIT(quotactl, selinux_quotactl),
+ 	LSM_HOOK_INIT(quota_on, selinux_quota_on),
+ 	LSM_HOOK_INIT(syslog, selinux_syslog),
+@@ -7313,6 +7389,7 @@ static struct security_hook_list selinux_hooks[] __lsm_ro_after_init = {
+ #endif
+ #ifdef CONFIG_KEYS
+ 	LSM_HOOK_INIT(key_alloc, selinux_key_alloc),
++	LSM_HOOK_INIT(key_alloc_nosmap, selinux_key_alloc_nosmap),
+ #endif
+ #ifdef CONFIG_AUDIT
+ 	LSM_HOOK_INIT(audit_rule_init, selinux_audit_rule_init),
+diff --git a/security/selinux/include/objsec.h b/security/selinux/include/objsec.h
+index ca4d7ab6a835..c9fd20e2e88a 100644
+--- a/security/selinux/include/objsec.h
++++ b/security/selinux/include/objsec.h
+@@ -150,7 +150,22 @@ struct perf_event_security_struct {
+ extern struct lsm_blob_sizes selinux_blob_sizes;
+ static inline struct task_security_struct *selinux_cred(const struct cred *cred)
+ {
+-	return cred->security + selinux_blob_sizes.lbs_cred;
++	struct task_security_struct *tss;
++
++	tss = cred->security + selinux_blob_sizes.lbs_cred;
++
++	return tss; 
++}
++
++static inline struct task_security_struct *selinux_cred_smap(const struct cred *cred)
++{
++	struct task_security_struct *tss;
++
++	ksmap_disable_smap();
++	tss = selinux_cred(cred);
++	ksmap_enable_smap();
++
++	return tss; 
+ }
+ 
+ static inline struct file_security_struct *selinux_file(const struct file *file)
+@@ -183,7 +198,7 @@ static inline struct ipc_security_struct *selinux_ipc(
+  */
+ static inline u32 current_sid(void)
+ {
+-	const struct task_security_struct *tsec = selinux_cred(current_cred());
++	const struct task_security_struct *tsec = selinux_cred_smap(current_cred());
+ 
+ 	return tsec->sid;
+ }
+diff --git a/tools/lib/subcmd/subcmd-util.h b/tools/lib/subcmd/subcmd-util.h
+index 794a375dad36..7009fc176636 100644
+--- a/tools/lib/subcmd/subcmd-util.h
++++ b/tools/lib/subcmd/subcmd-util.h
+@@ -49,13 +49,12 @@ static NORETURN inline void die(const char *err, ...)
+ 
+ static inline void *xrealloc(void *ptr, size_t size)
+ {
+-	void *ret = realloc(ptr, size);
+-	if (!ret && !size)
+-		ret = realloc(ptr, 1);
++	void *ret;
++	if (!size)
++		size = 1;
++	ret = realloc(ptr, size);
+ 	if (!ret) {
+ 		ret = realloc(ptr, size);
+-		if (!ret && !size)
+-			ret = realloc(ptr, 1);
+ 		if (!ret)
+ 			die("Out of memory, realloc failed");
+ 	}
+diff --git a/tools/perf/builtin-daemon.c b/tools/perf/builtin-daemon.c
+index 617feaf020f6..8f9fc61691da 100644
+--- a/tools/perf/builtin-daemon.c
++++ b/tools/perf/builtin-daemon.c
+@@ -161,7 +161,7 @@ static int session_config(struct daemon *daemon, const char *var, const char *va
+ 	struct daemon_session *session;
+ 	char name[100];
+ 
+-	if (get_session_name(var, name, sizeof(name)))
++	if (get_session_name(var, name, sizeof(name) - 1))
+ 		return -EINVAL;
+ 
+ 	var = strchr(var, '.');
